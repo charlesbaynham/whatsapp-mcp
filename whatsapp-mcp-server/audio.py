@@ -61,26 +61,30 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
         raise RuntimeError(f"Failed to convert audio. You likely need to install ffmpeg {e.stderr}")
 
 
-def convert_to_opus_ogg_temp(input_file, bitrate="32k", sample_rate=24000):
+def convert_to_opus_ogg_temp(input_file, store_dir, bitrate="32k", sample_rate=24000):
     """
-    Convert an audio file to Opus format in an Ogg container and store in a temporary file.
-    
+    Convert an audio file to Opus format in an Ogg container, writing the
+    result under store_dir so the bridge (which only accepts media_path
+    values inside the store directory) can send it.
+
     Args:
         input_file (str): Path to the input audio file
+        store_dir (str): The WhatsApp bridge's store directory
         bitrate (str, optional): Target bitrate for Opus encoding (default: "32k")
         sample_rate (int, optional): Sample rate for output (default: 24000)
-    
+
     Returns:
         str: Path to the temporary file with the converted audio
-        
+
     Raises:
         FileNotFoundError: If the input file doesn't exist
         RuntimeError: If the ffmpeg conversion fails
     """
-    # Create a temporary file with .ogg extension
-    temp_file = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    tmp_dir = os.path.join(store_dir, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(suffix=".ogg", dir=tmp_dir, delete=False)
     temp_file.close()
-    
+
     try:
         # Convert the audio
         convert_to_opus_ogg(input_file, temp_file.name, bitrate, sample_rate)
@@ -101,9 +105,10 @@ if __name__ == "__main__":
         sys.exit(1)
     
     input_file = sys.argv[1]
-    
+    store_dir = os.environ.get("WHATSAPP_STORE_DIR", tempfile.gettempdir())
+
     try:
-        result = convert_to_opus_ogg_temp(input_file)
+        result = convert_to_opus_ogg_temp(input_file, store_dir)
         print(f"Successfully converted to: {result}")
     except Exception as e:
         print(f"Error: {e}")
