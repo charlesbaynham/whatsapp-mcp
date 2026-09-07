@@ -14,7 +14,7 @@
         pname = "whatsapp-bridge";
         version = "0.1.0";
         src = ./whatsapp-bridge;
-        vendorHash = "sha256-8yTDqljzX2N69Q+GHA3BI8FXpR0nhR3N6ke1UFYPp6g=";
+        vendorHash = "sha256-iSAY8dD4JpKmcOQSIA1ffvdGemHn9vIExH8Kz+7sHZ0=";
         env.CGO_ENABLED = "1"; # go-sqlite3 is cgo.
       };
 
