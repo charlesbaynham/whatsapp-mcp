@@ -32,7 +32,13 @@ mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request: Request) -> JSONResponse:
-    """Liveness probe: healthy only once the bridge is connected and paired."""
+    """Liveness probe: fails only when the bridge process is unreachable.
+
+    Pairing is an operational state, not a deploy outcome: the deploy loop
+    treats a failed health check soon after a deploy as a bad template and
+    rolls back, so an unpaired or logged-out bridge must still report
+    healthy here rather than triggering a destroy/recreate loop.
+    """
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{WHATSAPP_API_BASE_URL}/status")
@@ -41,9 +47,11 @@ async def health(_request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"status": "error", "reason": f"bridge unreachable: {e}"}, status_code=503)
 
-    if status.get("connected") and status.get("logged_in"):
-        return JSONResponse({"status": "ok", **status})
-    return JSONResponse({"status": "error", "reason": "bridge not connected/logged in", **status}, status_code=503)
+    return JSONResponse({
+        "status": "ok",
+        "paired": bool(status.get("logged_in")),
+        "connected": bool(status.get("connected")),
+    })
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:

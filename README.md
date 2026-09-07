@@ -111,7 +111,7 @@ directory, and the Python server can serve MCP over HTTP instead of stdio.
 | `MCP_HOST` | `127.0.0.1` | Bind host when `MCP_TRANSPORT=streamable-http` |
 | `MCP_PORT` | `8000` | Bind port when `MCP_TRANSPORT=streamable-http` |
 
-When running with `MCP_TRANSPORT=streamable-http`, the MCP endpoint is served at `/mcp` and a liveness probe is served at `GET /health`, returning `200 {"status": "ok", ...}` only when the bridge is both connected and logged in, and `503` otherwise — suitable as a container health check.
+When running with `MCP_TRANSPORT=streamable-http`, the MCP endpoint is served at `/mcp` and a liveness probe is served at `GET /health`, returning `200 {"status": "ok", "paired": bool, "connected": bool}` whenever the bridge's `/api/status` answered at all, and `503 {"status": "error", "reason": "bridge unreachable: ..."}` only when it doesn't — pairing is an operational state, not a deploy outcome, so an unpaired or logged-out bridge is still a healthy process. Suitable as a container health check.
 
 ### Windows Compatibility
 
