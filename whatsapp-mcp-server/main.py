@@ -1,6 +1,13 @@
+import os
+
+import httpx
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
+    WHATSAPP_API_BASE_URL,
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
@@ -15,8 +22,28 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
+MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> JSONResponse:
+    """Liveness probe: healthy only once the bridge is connected and paired."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{WHATSAPP_API_BASE_URL}/status")
+        resp.raise_for_status()
+        status = resp.json()
+    except Exception as e:
+        return JSONResponse({"status": "error", "reason": f"bridge unreachable: {e}"}, status_code=503)
+
+    if status.get("connected") and status.get("logged_in"):
+        return JSONResponse({"status": "ok", **status})
+    return JSONResponse({"status": "error", "reason": "bridge not connected/logged in", **status}, status_code=503)
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -190,12 +217,13 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-    
+        media_path: The absolute path to the media file to send (image, video, document). Must be
+                 inside the WhatsApp store directory, e.g. a path returned by download_media.
+
     Returns:
         A dictionary containing success status and a status message
     """
-    
+
     # Call the whatsapp_send_file function
     success, status_message = whatsapp_send_file(recipient, media_path)
     return {
@@ -210,8 +238,10 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
+        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's
+                 not a .ogg file). Must be inside the WhatsApp store directory, e.g. a path returned by
+                 download_media.
+
     Returns:
         A dictionary containing success status and a status message
     """
@@ -248,4 +278,4 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     # Initialize and run the server
-    mcp.run(transport='stdio')
+    mcp.run(transport=MCP_TRANSPORT)

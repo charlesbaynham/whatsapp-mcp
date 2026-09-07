@@ -2,13 +2,34 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+import os
 import os.path
 import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+MESSAGES_DB_PATH = os.environ.get(
+    "WHATSAPP_MESSAGES_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db'),
+)
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:8080/api")
+STORE_DIR = os.environ.get("WHATSAPP_STORE_DIR", os.path.dirname(os.path.abspath(MESSAGES_DB_PATH)))
+
+REQUEST_TIMEOUT = 30
+MEDIA_SEND_TIMEOUT = 120
+
+
+def _resolve_in_store(path: str) -> str:
+    """Resolve path and confirm it lies inside STORE_DIR, following symlinks on both sides.
+
+    Mirrors the bridge's own containment check so a media_path outside the
+    store gets a clear error here instead of an opaque 400 from the bridge.
+    """
+    resolved_store = os.path.realpath(STORE_DIR)
+    resolved_path = os.path.realpath(path)
+    if resolved_path != resolved_store and not resolved_path.startswith(resolved_store + os.sep):
+        raise ValueError(f"media_path must be inside the store directory ({STORE_DIR}): {path}")
+    return resolved_path
 
 @dataclass
 class Message:
@@ -634,15 +655,15 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
-        
+        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -655,28 +676,33 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
-        
+
+        try:
+            media_path = _resolve_in_store(media_path)
+        except ValueError as e:
+            return False, str(e)
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        response = requests.post(url, json=payload, timeout=MEDIA_SEND_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -689,34 +715,39 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
 
         if not media_path.endswith(".ogg"):
             try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
+                media_path = audio.convert_to_opus_ogg_temp(media_path, STORE_DIR)
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-        
+
+        try:
+            media_path = _resolve_in_store(media_path)
+        except ValueError as e:
+            return False, str(e)
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        response = requests.post(url, json=payload, timeout=MEDIA_SEND_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -741,8 +772,8 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
-        
+        response = requests.post(url, json=payload, timeout=MEDIA_SEND_TIMEOUT)
+
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
