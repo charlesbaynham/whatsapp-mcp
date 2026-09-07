@@ -1,0 +1,17 @@
+name: Build Proxmox LXC template
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lxc-template:
+    permissions:
+      contents: write
+    uses: charlesbaynham/nix-proxmox-cattle/.github/workflows/build-template.yml@v1
+    with:
+      # This repo's default branch is `main`, not the reusable workflow's
+      # own default of `master`.
+      release_branch: main
