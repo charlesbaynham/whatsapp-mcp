@@ -680,13 +680,15 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
 
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-
+        # Containment must be checked before touching the filesystem at all,
+        # so a path outside the store can't even be probed for existence.
         try:
             media_path = _resolve_in_store(media_path)
         except ValueError as e:
             return False, str(e)
+
+        if not os.path.isfile(media_path):
+            return False, f"Media file not found: {media_path}"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
@@ -711,6 +713,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+    converted_path = None
     try:
         # Validate input
         if not recipient:
@@ -719,19 +722,24 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not media_path:
             return False, "Media path must be provided"
 
+        # Containment must be checked on the caller-supplied path before it is
+        # touched (existence check, ffmpeg conversion) or sent anywhere: an
+        # input outside the store must never be transcoded into the store,
+        # since that would launder any readable file into a sendable one.
+        try:
+            media_path = _resolve_in_store(media_path)
+        except ValueError as e:
+            return False, str(e)
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
 
         if not media_path.endswith(".ogg"):
             try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path, STORE_DIR)
+                converted_path = audio.convert_to_opus_ogg_temp(media_path, STORE_DIR)
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-
-        try:
-            media_path = _resolve_in_store(media_path)
-        except ValueError as e:
-            return False, str(e)
+            media_path = converted_path
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
@@ -754,6 +762,12 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+    finally:
+        if converted_path and os.path.exists(converted_path):
+            try:
+                os.unlink(converted_path)
+            except OSError:
+                pass
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
