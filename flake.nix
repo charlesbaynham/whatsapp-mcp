@@ -9,25 +9,16 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
 
-      # go-sqlite3 is cgo; CGO_ENABLED is off by default under buildGoModule's
-      # cross-compilation defaults, which would otherwise fail at link time
-      # with an unhelpful "undefined reference" rather than a clear error.
-      #
-      # go.mod's `go` directive outgrows this nixpkgs pin's default toolchain
-      # (1.26.7) the moment the hosted-service branch merges (it moves to
-      # 1.26.8, for the whatsmeow bump). go_1_27 is 1.27.1, already in this
-      # same pin, so overriding it needs no second nixpkgs input and satisfies
-      # both today's directive and the incoming one.
+      # go.mod wants go >= 1.26.8; this pin's default `go` is 1.26.7.
       bridge = (pkgs.buildGoModule.override { go = pkgs.go_1_27; }) {
         pname = "whatsapp-bridge";
         version = "0.1.0";
         src = ./whatsapp-bridge;
         vendorHash = "sha256-8yTDqljzX2N69Q+GHA3BI8FXpR0nhR3N6ke1UFYPp6g=";
-        env.CGO_ENABLED = "1";
+        env.CGO_ENABLED = "1"; # go-sqlite3 is cgo.
       };
 
-      # nixos-26.05 carries mcp 1.26.0: past the 1.10 floor streamable-http
-      # needs, and below 2.0, which renames FastMCP - so no overlay is needed.
+      # nixos-26.05 already carries mcp 1.26.0 (>=1.10,<2), so no overlay.
       mcpEnv = pkgs.python3.withPackages (ps: [ ps.mcp ps.requests ps.httpx ]);
     in
     cattle.lib.mkTemplate {
