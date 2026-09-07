@@ -84,6 +84,35 @@ Here's an example of what you can do when it's connected to Claude.
 
    Or restart Cursor.
 
+## Running as a hosted service
+
+Both components can also run unattended on a server instead of a laptop —
+the Go bridge binds to loopback and stores its state in a configurable
+directory, and the Python server can serve MCP over HTTP instead of stdio.
+
+### `whatsapp-bridge` environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `WHATSAPP_STORE_DIR` | `store` | Directory for `whatsapp.db`, `messages.db` and downloaded media |
+| `WHATSAPP_BRIDGE_ADDR` | `127.0.0.1:8080` | Listen address for the REST API |
+| `WHATSAPP_LOG_MESSAGE_BODIES` | unset | Set to `1` to log message content to stdout; by default only metadata (timestamp, direction, chat, media type) is logged |
+
+`GET /api/status` returns `{"connected": bool, "logged_in": bool, "jid": "..."}` (always HTTP 200) and can be polled before pairing. The REST server starts before the QR/pairing step, so `/api/status` is answerable immediately; `/api/send` and `/api/download` return `503` with a JSON `{"error": "..."}` body until the bridge is connected and logged in. On first run, scan the printed QR code from the process's stdout (e.g. via `journalctl` if run under systemd) — there is no timeout, so a headless deployment can just wait for it to be scanned.
+
+### `whatsapp-mcp-server` environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `WHATSAPP_MESSAGES_DB` | `../whatsapp-bridge/store/messages.db` (relative to the server source) | Path to the bridge's `messages.db` |
+| `WHATSAPP_STORE_DIR` | Directory of `WHATSAPP_MESSAGES_DB` | The bridge's store directory; `media_path` values for `send_file`/`send_audio_message` must resolve inside it |
+| `WHATSAPP_BRIDGE_URL` | `http://localhost:8080/api` | Base URL of the bridge's REST API |
+| `MCP_TRANSPORT` | `stdio` | `stdio` (upstream default) or `streamable-http` |
+| `MCP_HOST` | `127.0.0.1` | Bind host when `MCP_TRANSPORT=streamable-http` |
+| `MCP_PORT` | `8000` | Bind port when `MCP_TRANSPORT=streamable-http` |
+
+When running with `MCP_TRANSPORT=streamable-http`, the MCP endpoint is served at `/mcp` and a liveness probe is served at `GET /health`, returning `200 {"status": "ok", "paired": bool, "connected": bool}` whenever the bridge's `/api/status` answered at all, and `503 {"status": "error", "reason": "bridge unreachable: ..."}` only when it doesn't — pairing is an operational state, not a deploy outcome, so an unpaired or logged-out bridge is still a healthy process. Suitable as a container health check.
+
 ### Windows Compatibility
 
 If you're running this project on Windows, be aware that `go-sqlite3` requires **CGO to be enabled** in order to compile and work properly. By default, **CGO is disabled on Windows**, so you need to explicitly enable it and have a C compiler installed.
