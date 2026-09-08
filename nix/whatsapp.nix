@@ -84,6 +84,12 @@ in
         services.yaml, which is also what the deploy health check polls.
       '';
     };
+
+    allowedSources = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "10.0.1.34" "10.0.1.3" ];
+      description = "Hosts allowed to reach mcpPort: gardenfacer (the ingress) and the hypervisor (the deploy health check).";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -152,7 +158,9 @@ in
       };
     };
 
-    # The bridge is loopback-only; only the MCP port needs a firewall rule.
-    networking.firewall.allowedTCPPorts = [ cfg.mcpPort ];
+    # allowedSources must include the hypervisor: it health-checks this port after every deploy, and blocking it triggers a rollback.
+    networking.firewall.extraCommands = lib.concatMapStringsSep "\n"
+      (src: "iptables -A nixos-fw -p tcp -s ${src} --dport ${toString cfg.mcpPort} -j nixos-fw-accept")
+      cfg.allowedSources;
   };
 }
