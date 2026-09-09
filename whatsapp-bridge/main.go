@@ -826,6 +826,49 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr 
 		})
 	})
 
+	// Handler for requesting more on-demand history for one chat
+	mux.HandleFunc("/api/resync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !requireReady(client, w) {
+			return
+		}
+
+		var req ResyncRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		lastKnown, count, err := parseResyncRequest(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("Requesting %d messages of history for %s before %s\n", count, lastKnown.Chat, lastKnown.ID)
+
+		historyMsg := client.BuildHistorySyncRequest(lastKnown, count)
+		_, err = client.SendPeerMessage(r.Context(), historyMsg)
+
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ResyncResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to request history sync: %v", err),
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(ResyncResponse{
+			Success: true,
+			Message: fmt.Sprintf("Requested up to %d messages before %s in %s; they arrive as an on-demand history sync event", count, lastKnown.ID, lastKnown.Chat),
+		})
+	})
+
 	server := &http.Server{Addr: addr, Handler: mux}
 	fmt.Printf("Starting REST API server on %s...\n", addr)
 
@@ -1067,6 +1110,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger, logBodies bool) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
+	ctx := context.Background()
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
@@ -1074,14 +1118,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
-
 		// Try to parse the JID
-		jid, err := types.ParseJID(chatJID)
+		jid, err := types.ParseJID(*conversation.ID)
 		if err != nil {
-			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
+			logger.Warnf("Failed to parse JID %s: %v", *conversation.ID, err)
 			continue
 		}
+
+		// Resolve LID addressing the same way handleMessage does, so a
+		// history-synced chat lands in the same row as one seen live.
+		jid = canonicalHistorySyncChatJID(ctx, client.Store, jid, conversation.GetPnJID())
+		chatJID := jid.String()
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
@@ -1141,18 +1188,27 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Determine sender
+				// Determine sender. jid is already the resolved canonical
+				// chat JID; a group participant is resolved the same way
+				// canonicalSenderJID resolves a live one, but history sync
+				// carries no per-message alt address, so this can only fall
+				// back to the resolver's local cache (see lid.go).
 				var sender string
 				isFromMe := false
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
-					} else {
+					switch {
+					case !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "":
+						if participant, err := types.ParseJID(*msg.Message.Key.Participant); err == nil {
+							sender = resolveAlt(ctx, client.Store, participant, types.JID{}).User
+						} else {
+							sender = *msg.Message.Key.Participant
+						}
+					case isFromMe:
+						sender = resolveAlt(ctx, client.Store, *client.Store.ID, types.JID{}).User
+					default:
 						sender = jid.User
 					}
 				} else {

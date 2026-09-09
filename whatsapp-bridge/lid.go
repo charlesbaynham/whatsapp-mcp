@@ -65,3 +65,23 @@ func canonicalSenderJID(ctx context.Context, resolver altJIDResolver, info types
 		return chat
 	}
 }
+
+// canonicalHistorySyncChatJID resolves a history-sync Conversation's own JID
+// the same way canonicalChatJID resolves a live message's chat. A live
+// stanza's SenderAlt/RecipientAlt has no equivalent on the per-message
+// records history sync carries, but the Conversation record itself carries
+// one for its own JID: pnJID, the phone-number counterpart of a
+// LID-addressed conversation. Treat it exactly as a stanza alt, preferred
+// over the resolver's local cache. pnJID that fails to parse is treated as
+// absent rather than as an error, since the local cache is still a valid
+// fallback.
+func canonicalHistorySyncChatJID(ctx context.Context, resolver altJIDResolver, jid types.JID, pnJID string) types.JID {
+	// types.ParseJID barely validates: a bare string with no "@" parses
+	// "successfully" into a JID with an empty User, so a missing or
+	// malformed pnJID must be caught on User rather than on err alone.
+	alt := types.JID{}
+	if parsed, err := types.ParseJID(pnJID); err == nil && parsed.User != "" {
+		alt = parsed
+	}
+	return resolveAlt(ctx, resolver, jid, alt)
+}

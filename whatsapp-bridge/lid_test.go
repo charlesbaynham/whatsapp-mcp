@@ -96,6 +96,33 @@ func TestCanonicalChatJID(t *testing.T) {
 	}
 }
 
+func TestCanonicalHistorySyncChatJID(t *testing.T) {
+	lidChat := jid("111", types.HiddenUserServer)
+	pnFromStore := jid("447700900000", types.DefaultUserServer)
+	pnFromRecord := jid("447700900111", types.DefaultUserServer)
+	resolver := fakeAltResolver{alts: map[types.JID]types.JID{lidChat: pnFromStore}}
+
+	cases := []struct {
+		name  string
+		jid   types.JID
+		pnJID string
+		want  types.JID
+	}{
+		{"conversation's own pnJID is preferred", lidChat, pnFromRecord.String(), pnFromRecord},
+		{"falls back to the store when pnJID is absent", lidChat, "", pnFromStore},
+		{"an unparseable pnJID is treated as absent, not an error", lidChat, "not a jid", pnFromStore},
+		{"already a phone number is untouched even with a pnJID present", pnFromRecord, "999@lid", pnFromRecord},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := canonicalHistorySyncChatJID(context.Background(), resolver, c.jid, c.pnJID)
+			if got != c.want {
+				t.Fatalf("canonicalHistorySyncChatJID(%v, pnJID=%q) = %v, want %v", c.jid, c.pnJID, got, c.want)
+			}
+		})
+	}
+}
+
 func TestCanonicalSenderJID(t *testing.T) {
 	myLID := jid("111", types.HiddenUserServer)
 	myPN := jid("447700900000", types.DefaultUserServer)
