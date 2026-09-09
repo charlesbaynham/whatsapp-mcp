@@ -929,7 +929,7 @@ func main() {
 			switch evt.Event {
 			case "code":
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				qrterminal.GenerateHalfBlock(pairingPayload(evt.Code), qrterminal.L, os.Stdout)
 			case "success":
 				success = true
 			default:
