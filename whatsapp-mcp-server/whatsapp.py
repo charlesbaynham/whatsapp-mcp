@@ -1,7 +1,8 @@
 import sqlite3
+import dataclasses
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os
 import os.path
 import requests
@@ -112,6 +113,32 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def message_to_dict(message: Message) -> Dict[str, Any]:
+    data = dataclasses.asdict(message)
+    data["timestamp"] = message.timestamp.isoformat()
+    data["sender_name"] = "Me" if message.is_from_me else get_sender_name(message.sender)
+    return data
+
+
+def chat_to_dict(chat: Chat) -> Dict[str, Any]:
+    data = dataclasses.asdict(chat)
+    data["last_message_time"] = chat.last_message_time.isoformat() if chat.last_message_time else None
+    data["is_group"] = chat.is_group  # a @property, dropped by asdict()
+    return data
+
+
+def contact_to_dict(contact: Contact) -> Dict[str, Any]:
+    return dataclasses.asdict(contact)
+
+
+def message_context_to_dict(context: MessageContext) -> Dict[str, Any]:
+    return {
+        "message": message_to_dict(context.message),
+        "before": [message_to_dict(m) for m in context.before],
+        "after": [message_to_dict(m) for m in context.after],
+    }
+
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
@@ -130,16 +157,6 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
-    return output
-
-def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
-    output = ""
-    if not messages:
-        output += "No messages to display."
-        return output
-    
-    for message in messages:
-        output += format_message(message, show_chat_info)
     return output
 
 def list_messages(
@@ -230,12 +247,12 @@ def list_messages(
                 messages_with_context.extend(context.before)
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
-            
-            return format_messages_list(messages_with_context, show_chat_info=True)
-            
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
-        
+
+            return messages_with_context
+
+        return result
+
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
