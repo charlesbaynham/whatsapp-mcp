@@ -422,12 +422,17 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger, logBodies bool) {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Save message to database. Resolve LID addressing to phone numbers
+	// where whatsmeow's local mapping store lets us, so a contact ends up
+	// under one chat JID regardless of which addressing form WhatsApp used
+	// for a given message.
+	ctx := context.Background()
+	chat := canonicalChatJID(ctx, client.Store, msg.Info.MessageSource)
+	chatJID := chat.String()
+	sender := canonicalSenderJID(ctx, client.Store, msg.Info.MessageSource, chat).User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
