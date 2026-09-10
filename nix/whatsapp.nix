@@ -87,8 +87,8 @@ in
 
     allowedSources = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "10.0.1.34" "10.0.1.3" ];
-      description = "Hosts allowed to reach mcpPort: gardenfacer (the ingress) and the hypervisor (the deploy health check).";
+      default = [ "10.0.1.34" "10.0.1.31" "10.0.1.3" ];
+      description = "Hosts allowed to reach mcpPort: gardenfacer (internal ingress), wallfacer (the border router, behind mcp-auth) and the hypervisor (the deploy health check).";
     };
   };
 
