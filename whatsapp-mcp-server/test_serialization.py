@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -67,6 +68,23 @@ class ChatSerializationTests(unittest.TestCase):
         self.assertEqual(
             whatsapp.chat_to_dict(chat)["last_message_time"], "2026-09-09T08:00:00"
         )
+
+    def test_unread_fields_serialize(self):
+        chat = Chat(
+            jid="123@s.whatsapp.net",
+            name="Bob",
+            last_message_time=None,
+            unread_count=3,
+            last_read_at=datetime(2026, 9, 9, 8, 0, 0),
+        )
+        data = whatsapp.chat_to_dict(chat)
+        json.dumps(data)  # must not raise: no datetime leaked into output
+        self.assertEqual(data["unread_count"], 3)
+        self.assertEqual(data["last_read_at"], "2026-09-09T08:00:00")
+
+    def test_last_read_at_none_stays_none(self):
+        chat = Chat(jid="123@s.whatsapp.net", name="Bob", last_message_time=None)
+        self.assertIsNone(whatsapp.chat_to_dict(chat)["last_read_at"])
 
 
 class ContactSerializationTests(unittest.TestCase):

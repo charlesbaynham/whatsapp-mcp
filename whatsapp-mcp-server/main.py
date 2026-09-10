@@ -11,6 +11,8 @@ from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
+    list_unread_chats as whatsapp_list_unread_chats,
+    mark_chat_read as whatsapp_mark_chat_read,
     get_chat as whatsapp_get_chat,
     get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
     get_contact_chats as whatsapp_get_contact_chats,
@@ -114,24 +116,38 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    unread_only: bool = False
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp chats matching specified criteria.
-    
+
     Args:
         query: Optional search term to filter chats by name or JID
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+        unread_only: If True, only return chats that have unread incoming messages (default False)
     """
     chats = whatsapp_list_chats(
         query=query,
         limit=limit,
         page=page,
         include_last_message=include_last_message,
-        sort_by=sort_by
+        sort_by=sort_by,
+        unread_only=unread_only
     )
+    return [chat_to_dict(c) for c in chats]
+
+@mcp.tool()
+def list_unread_chats(limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
+    """List WhatsApp chats that currently have unread incoming messages.
+
+    Args:
+        limit: Maximum number of chats to return (default 20)
+        page: Page number for pagination (default 0)
+    """
+    chats = whatsapp_list_unread_chats(limit, page)
     return [chat_to_dict(c) for c in chats]
 
 @mcp.tool()
@@ -221,6 +237,27 @@ def send_message(
         "success": success,
         "message": status_message
     }
+
+@mcp.tool()
+def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
+    """Mark a WhatsApp chat as read. This is the ONLY way read state changes in this
+    server: listing or reading messages (list_messages, get_chat, list_chats, etc.)
+    never marks anything as read as a side effect.
+
+    send_receipt=False (default): clears the chat's unread count and syncs that
+    state to your other WhatsApp devices WITHOUT notifying the sender.
+    send_receipt=True: sends real WhatsApp read receipts (blue ticks) that the
+    sender WILL see. Only pass True when the user explicitly asks for that.
+
+    Args:
+        chat_jid: The JID of the chat to mark as read
+        send_receipt: Whether to send real read receipts visible to the sender (default False)
+
+    Returns:
+        A dictionary with success status, a status message, marked_count (how many
+        messages were marked read), and receipt_sent (whether a receipt was sent)
+    """
+    return whatsapp_mark_chat_read(chat_jid, send_receipt)
 
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:

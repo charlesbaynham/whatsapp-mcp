@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -72,7 +73,8 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			last_read_timestamp TIMESTAMP
 		);
 
 		CREATE TABLE IF NOT EXISTS messages (
@@ -98,6 +100,40 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Gated on the column being absent: must only run once, or it would wipe real unread state.
+	hasReadTimestampCol := false
+	colRows, err := db.Query(`PRAGMA table_info(chats)`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to inspect chats schema: %v", err)
+	}
+	for colRows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltValue any
+		if err := colRows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			colRows.Close()
+			db.Close()
+			return nil, fmt.Errorf("failed to read chats schema: %v", err)
+		}
+		if name == "last_read_timestamp" {
+			hasReadTimestampCol = true
+		}
+	}
+	colRows.Close()
+
+	if !hasReadTimestampCol {
+		if _, err = db.Exec(`ALTER TABLE chats ADD COLUMN last_read_timestamp TIMESTAMP`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to add last_read_timestamp column: %v", err)
+		}
+		if _, err = db.Exec(`UPDATE chats SET last_read_timestamp = last_message_time`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to backfill last_read_timestamp: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db, StoreDir: storeDir}, nil
 }
 
@@ -106,13 +142,92 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Upsert, not INSERT OR REPLACE: REPLACE would null out last_read_timestamp on every message.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
 	return err
+}
+
+// Forward-only; julianday() because stored RFC3339Nano text isn't safely comparable across offsets.
+func (store *MessageStore) MarkChatRead(chatJID string, upTo time.Time) error {
+	_, err := store.db.Exec(
+		`UPDATE chats SET last_read_timestamp = ?
+		 WHERE jid = ? AND (last_read_timestamp IS NULL OR julianday(last_read_timestamp) < julianday(?))`,
+		upTo, chatJID, upTo,
+	)
+	return err
+}
+
+// Non-monotonic set; zero Time clears the marker to NULL.
+func (store *MessageStore) SetChatReadMarker(chatJID string, t time.Time) error {
+	var marker sql.NullTime
+	if !t.IsZero() {
+		marker = sql.NullTime{Time: t, Valid: true}
+	}
+	_, err := store.db.Exec(`UPDATE chats SET last_read_timestamp = ? WHERE jid = ?`, marker, chatJID)
+	return err
+}
+
+// Only sets the marker if it is currently unset, so it never overwrites real unread state.
+func (store *MessageStore) seedReadMarkerIfUnset(chatJID string, t time.Time) error {
+	_, err := store.db.Exec(
+		`UPDATE chats SET last_read_timestamp = ? WHERE jid = ? AND last_read_timestamp IS NULL`,
+		t, chatJID,
+	)
+	return err
+}
+
+// Returns the zero Time if there are no incoming messages.
+func (store *MessageStore) newestIncomingTimestamp(chatJID string) (time.Time, error) {
+	var ts sql.NullTime
+	err := store.db.QueryRow(
+		`SELECT MAX(timestamp) FROM messages WHERE chat_jid = ? AND is_from_me = 0`,
+		chatJID,
+	).Scan(&ts)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !ts.Valid {
+		return time.Time{}, nil
+	}
+	return ts.Time, nil
+}
+
+// UnreadMessage is one row of an unread-messages query.
+type UnreadMessage struct {
+	ID        string
+	Sender    string
+	Timestamp time.Time
+}
+
+// A NULL marker means nothing has ever been marked read, so everything is unread.
+func (store *MessageStore) GetUnreadMessages(chatJID string) ([]UnreadMessage, error) {
+	rows, err := store.db.Query(
+		`SELECT m.id, m.sender, m.timestamp
+		 FROM messages m JOIN chats c ON c.jid = m.chat_jid
+		 WHERE m.chat_jid = ? AND m.is_from_me = 0
+		   AND (c.last_read_timestamp IS NULL OR julianday(m.timestamp) > julianday(c.last_read_timestamp))
+		 ORDER BY m.timestamp ASC`,
+		chatJID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var unread []UnreadMessage
+	for rows.Next() {
+		var u UnreadMessage
+		if err := rows.Scan(&u.ID, &u.Sender, &u.Timestamp); err != nil {
+			return nil, err
+		}
+		unread = append(unread, u)
+	}
+	return unread, rows.Err()
 }
 
 // Store a message in the database
@@ -869,6 +984,97 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr 
 		})
 	})
 
+	// The only place read state changes; the receive path never marks read.
+	mux.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !requireReady(client, w) {
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		// types.ParseJID barely validates, so malformed input is caught on User rather than err alone.
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil || chat.User == "" {
+			http.Error(w, fmt.Sprintf("invalid chat_jid: %q", req.ChatJID), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		unread, err := messageStore.GetUnreadMessages(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(MarkReadResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to look up unread messages: %v", err),
+			})
+			return
+		}
+
+		if len(unread) == 0 {
+			json.NewEncoder(w).Encode(MarkReadResponse{
+				Success:     true,
+				Message:     "chat already has no unread messages",
+				MarkedCount: 0,
+				ReceiptSent: false,
+			})
+			return
+		}
+
+		receiptType := types.ReceiptTypeReadSelf
+		if req.SendReceipt {
+			receiptType = types.ReceiptTypeRead
+		}
+
+		order, bySender := groupUnreadBySender(unread)
+		var receiptErr error
+		for _, sender := range order {
+			senderJID := senderJIDForMarkRead(chat, sender)
+			if err := client.MarkRead(r.Context(), bySender[sender], time.Now(), chat, senderJID, receiptType); err != nil {
+				fmt.Printf("Failed to send read receipt for %d message(s) from %s in %s: %v\n", len(bySender[sender]), senderJID, chat, err)
+				if receiptErr == nil {
+					receiptErr = err
+				}
+			}
+		}
+
+		// Always advance the marker: a failed receipt must not leave the chat stuck unread.
+		newest := unread[len(unread)-1].Timestamp
+		if err := messageStore.MarkChatRead(req.ChatJID, newest); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(MarkReadResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to update read marker: %v", err),
+			})
+			return
+		}
+
+		resp := MarkReadResponse{
+			Success:     true,
+			MarkedCount: len(unread),
+			ReceiptSent: req.SendReceipt && receiptErr == nil,
+		}
+		if receiptErr != nil {
+			resp.Message = fmt.Sprintf("Marked %d message(s) read, but sending the read receipt failed: %v", len(unread), receiptErr)
+		} else {
+			resp.Message = fmt.Sprintf("Marked %d message(s) read", len(unread))
+		}
+		fmt.Printf("Marked %d message(s) read in %s (send_receipt=%v, receipt_sent=%v)\n", len(unread), req.ChatJID, req.SendReceipt, resp.ReceiptSent)
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	server := &http.Server{Addr: addr, Handler: mux}
 	fmt.Printf("Starting REST API server on %s...\n", addr)
 
@@ -943,6 +1149,12 @@ func main() {
 
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger, logBodies)
+
+		case *events.Receipt:
+			handleReceipt(client, messageStore, v, logger)
+
+		case *events.MarkChatAsRead:
+			handleMarkChatAsRead(client, messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -1151,6 +1363,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			}
 
 			messageStore.StoreChat(chatJID, name, timestamp)
+
+			// Seed only on initial syncs; ON_DEMAND resyncs pull older history and must not touch the marker.
+			if historySync.Data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
+				if err := messageStore.seedReadMarkerIfUnset(chatJID, timestamp); err != nil {
+					logger.Warnf("Failed to seed read marker for %s: %v", chatJID, err)
+				}
+			}
 
 			// Store messages
 			for _, msg := range messages {
