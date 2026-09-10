@@ -211,7 +211,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, storeDir, recipient, message, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath string, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -241,7 +241,7 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, storeDir
 
 	// Check if we have media to send
 	if mediaPath != "" {
-		resolvedPath, err := containExistingPath(storeDir, mediaPath)
+		resolvedPath, err := containExistingPath(messageStore.StoreDir, mediaPath)
 		if err != nil {
 			return false, fmt.Sprintf("Rejected media_path: %v", err)
 		}
@@ -374,10 +374,30 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, storeDir
 	}
 
 	// Send message
-	_, err = client.SendMessage(ctx, recipientJID, msg)
+	resp, err := client.SendMessage(ctx, recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// whatsmeow only loops a message back through the event handler (which is
+	// what handleMessage/StoreMessage normally run from) for messages arriving
+	// from someone else or synced from another of our own linked devices - a
+	// message this connection just sent gets no such event. Mirror it into the
+	// store here, or it delivers but never appears in list_messages/get_chat.
+	chatJID := recipientJID.String()
+	mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	sender := ""
+	if client.Store.ID != nil {
+		sender = client.Store.ID.User
+	}
+	name := GetChatName(client, messageStore, recipientJID, chatJID, nil, recipientJID.User, logger)
+	if err := messageStore.StoreChat(chatJID, name, resp.Timestamp); err != nil {
+		logger.Warnf("Failed to store chat: %v", err)
+	}
+	if err := messageStore.StoreMessage(resp.ID, chatJID, sender, message, resp.Timestamp, true,
+		mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		logger.Warnf("Failed to store sent message: %v", err)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -717,7 +737,7 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr string, logBodies bool) *http.Server {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
@@ -766,7 +786,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr 
 			fmt.Println("Received request to send message to", req.Recipient)
 		}
 
-		success, message := sendWhatsAppMessage(r.Context(), client, messageStore.StoreDir, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, logger)
 		fmt.Println("Message sent", success, message)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -954,7 +974,7 @@ func main() {
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, bridgeAddr, logBodies)
+	server := startRESTServer(client, messageStore, bridgeAddr, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {
