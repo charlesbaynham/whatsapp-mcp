@@ -100,6 +100,11 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	if err := createWebhookSubscriptionsTable(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	// Gated on the column being absent: must only run once, or it would wipe real unread state.
 	hasReadTimestampCol := false
 	colRows, err := db.Query(`PRAGMA table_info(chats)`)
@@ -556,7 +561,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger, logBodies bool) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, msg *events.Message, logger waLog.Logger, logBodies bool) {
 	// Save message to database. Resolve LID addressing to phone numbers
 	// where whatsmeow's local mapping store lets us, so a contact ends up
 	// under one chat JID regardless of which addressing form WhatsApp used
@@ -606,6 +611,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 		return
+	}
+
+	if dispatcher != nil {
+		dispatcher.Notify(WebhookEvent{
+			MessageID: msg.Info.ID,
+			ChatJID:   chatJID,
+			ChatName:  name,
+			Sender:    sender,
+			Content:   content,
+			Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
+			IsFromMe:  msg.Info.IsFromMe,
+			MediaType: mediaType,
+			Filename:  filename,
+		})
 	}
 
 	// Log message reception. Body content is only logged when explicitly
@@ -852,8 +871,10 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, addr string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
+
+	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		jid := ""
@@ -1161,11 +1182,14 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Dispatches incoming messages to any subscribed webhooks.
+	dispatcher := NewWebhookDispatcher(messageStore, logger)
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			handleMessage(client, messageStore, v, logger, logBodies)
+			handleMessage(client, messageStore, dispatcher, v, logger, logBodies)
 
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger, logBodies)
@@ -1186,7 +1210,7 @@ func main() {
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, bridgeAddr, logBodies, logger)
+	server := startRESTServer(client, messageStore, dispatcher, bridgeAddr, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {

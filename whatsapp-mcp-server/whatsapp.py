@@ -773,6 +773,167 @@ def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
     except Exception as e:
         return {"success": False, "message": f"Unexpected error: {str(e)}", "marked_count": 0, "receipt_sent": False}
 
+def _subscription_to_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a bridge subscription record, never surfacing the raw bearer token."""
+    return {
+        "id": data.get("id"),
+        "chat_jid": data.get("chat_jid"),
+        "url": data.get("url"),
+        "bearer_token_hint": data.get("bearer_token_hint", ""),
+        "kind": data.get("kind"),
+        "headers": data.get("headers", {}),
+        "include_from_me": data.get("include_from_me", False),
+        "debounce_seconds": data.get("debounce_seconds", 0),
+        "enabled": data.get("enabled", True),
+        "created_at": data.get("created_at"),
+        "last_fired_at": data.get("last_fired_at"),
+        "last_status": data.get("last_status"),
+        "last_error": data.get("last_error"),
+        "disabled_reason": data.get("disabled_reason", ""),
+        "consecutive_failures": data.get("consecutive_failures", 0),
+        "expires_at": data.get("expires_at"),
+        "max_per_hour": data.get("max_per_hour", 60),
+    }
+
+
+def subscribe_chat(
+    chat_jid: str,
+    url: str,
+    bearer_token: str = "",
+    kind: str = "claude_routine",
+    headers: Optional[Dict[str, str]] = None,
+    include_from_me: bool = False,
+    debounce_seconds: int = 0,
+    ttl_seconds: int = 0,
+    max_per_hour: int = 60,
+) -> Dict[str, Any]:
+    try:
+        if not chat_jid:
+            return {"success": False, "message": "chat_jid must be provided"}
+        if not url:
+            return {"success": False, "message": "url must be provided"}
+
+        api_url = f"{WHATSAPP_API_BASE_URL}/webhooks"
+        payload = {
+            "chat_jid": chat_jid,
+            "url": url,
+            "bearer_token": bearer_token,
+            "kind": kind,
+            "headers": headers or {},
+            "include_from_me": include_from_me,
+            "debounce_seconds": debounce_seconds,
+            "ttl_seconds": ttl_seconds,
+            "max_per_hour": max_per_hour,
+        }
+
+        response = requests.post(api_url, json=payload, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 201:
+            result = response.json()
+            return {"success": True, "message": "Subscription created", "subscription": _subscription_to_dict(result)}
+        else:
+            return {"success": False, "message": f"Error: HTTP {response.status_code} - {response.text}"}
+
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+    except json.JSONDecodeError:
+        return {"success": False, "message": f"Error parsing response: {response.text}"}
+    except Exception as e:
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}
+
+
+def unsubscribe_chat(subscription_id: int) -> Dict[str, Any]:
+    try:
+        if subscription_id is None:
+            return {"success": False, "message": "subscription_id must be provided"}
+
+        api_url = f"{WHATSAPP_API_BASE_URL}/webhooks/{subscription_id}"
+        response = requests.delete(api_url, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 204:
+            return {"success": True, "message": "Subscription deleted"}
+        elif response.status_code == 404:
+            return {"success": False, "message": f"Subscription {subscription_id} not found"}
+        else:
+            return {"success": False, "message": f"Error: HTTP {response.status_code} - {response.text}"}
+
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}
+
+
+def enable_subscription(subscription_id: int) -> Dict[str, Any]:
+    try:
+        if subscription_id is None:
+            return {"success": False, "message": "subscription_id must be provided"}
+
+        api_url = f"{WHATSAPP_API_BASE_URL}/webhooks/{subscription_id}/enable"
+        response = requests.post(api_url, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 200:
+            result = response.json()
+            return {"success": True, "message": "Subscription enabled", "subscription": _subscription_to_dict(result)}
+        elif response.status_code == 404:
+            return {"success": False, "message": f"Subscription {subscription_id} not found"}
+        else:
+            return {"success": False, "message": f"Error: HTTP {response.status_code} - {response.text}"}
+
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+    except json.JSONDecodeError:
+        return {"success": False, "message": f"Error parsing response: {response.text}"}
+    except Exception as e:
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}
+
+
+def list_subscriptions() -> List[Dict[str, Any]]:
+    try:
+        api_url = f"{WHATSAPP_API_BASE_URL}/webhooks"
+        response = requests.get(api_url, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 200:
+            return [_subscription_to_dict(item) for item in response.json()]
+        else:
+            print(f"Error listing subscriptions: HTTP {response.status_code} - {response.text}")
+            return []
+
+    except requests.RequestException as e:
+        print(f"Request error listing subscriptions: {str(e)}")
+        return []
+    except Exception as e:
+        print(f"Unexpected error listing subscriptions: {str(e)}")
+        return []
+
+
+def test_subscription(subscription_id: int) -> Dict[str, Any]:
+    try:
+        if subscription_id is None:
+            return {"success": False, "status": 0, "error": "subscription_id must be provided"}
+
+        api_url = f"{WHATSAPP_API_BASE_URL}/webhooks/{subscription_id}/test"
+        response = requests.post(api_url, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 200:
+            result = response.json()
+            return {
+                "success": result.get("success", False),
+                "status": result.get("status", 0),
+                "error": result.get("error", ""),
+            }
+        elif response.status_code == 404:
+            return {"success": False, "status": 404, "error": f"Subscription {subscription_id} not found"}
+        else:
+            return {"success": False, "status": response.status_code, "error": f"HTTP {response.status_code} - {response.text}"}
+
+    except requests.RequestException as e:
+        return {"success": False, "status": 0, "error": f"Request error: {str(e)}"}
+    except json.JSONDecodeError:
+        return {"success": False, "status": 0, "error": f"Error parsing response: {response.text}"}
+    except Exception as e:
+        return {"success": False, "status": 0, "error": f"Unexpected error: {str(e)}"}
+
+
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input
