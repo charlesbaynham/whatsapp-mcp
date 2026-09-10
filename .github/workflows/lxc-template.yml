@@ -1,5 +1,8 @@
-name: Build Proxmox LXC template
+name: Build Proxmox LXC templates
 
+# Both jobs build from the exact same source - the app has no per-account
+# config, so `whatsapp` and `charlesbot-whatsapp` are the identical image
+# under two names. No path filtering: every push rebuilds both.
 on:
   push:
     branches: [main]
@@ -7,7 +10,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  lxc-template:
+  whatsapp:
     permissions:
       contents: write
     uses: charlesbaynham/nix-proxmox-cattle/.github/workflows/build-template.yml@v1
@@ -15,3 +18,12 @@ jobs:
       # This repo's default branch is `main`, not the reusable workflow's
       # own default of `master`.
       release_branch: main
+      attr: whatsapp
+
+  charlesbot-whatsapp:
+    permissions:
+      contents: write
+    uses: charlesbaynham/nix-proxmox-cattle/.github/workflows/build-template.yml@v1
+    with:
+      release_branch: main
+      attr: charlesbot-whatsapp
