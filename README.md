@@ -159,7 +159,8 @@ Claude can access the following tools to interact with WhatsApp:
 
 - **search_contacts**: Search for contacts by name or phone number
 - **list_messages**: Retrieve messages with optional filters and context
-- **list_chats**: List available chats with metadata
+- **list_chats**: List available chats with metadata, optionally filtered to only chats with unread messages via `unread_only`
+- **list_unread_chats**: List chats that currently have unread incoming messages
 - **get_chat**: Get information about a specific chat
 - **get_direct_chat_by_contact**: Find a direct chat with a specific contact
 - **get_contact_chats**: List all chats involving a specific contact
@@ -169,6 +170,11 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **mark_chat_read**: Explicitly mark a chat as read, optionally sending real read receipts
+
+### Read/Unread Tracking
+
+Chats carry an `unread_count` and `last_read_at`. Reading messages (`list_messages`, `get_chat`, etc.) never changes this state — the only way to mark a chat read is the explicit `mark_chat_read` tool, which has two modes: by default (`send_receipt=False`) it silently clears the unread count and syncs that state to your other WhatsApp devices without notifying the sender; with `send_receipt=True` it sends real WhatsApp read receipts (blue ticks) that the sender will see. On upgrade, or on first pairing a device, all pre-existing messages are treated as already read, so only new incoming messages from that point on will ever show up as unread.
 
 ### Media Handling Features
 
