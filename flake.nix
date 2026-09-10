@@ -1,5 +1,5 @@
 {
-  description = "WhatsApp MCP server, packaged as a cattle container";
+  description = "WhatsApp MCP server, packaged as a cattle container. Two templates share this one app - `whatsapp` and `charlesbot-whatsapp` build the identical image, deployed as two separate containers each holding its own WhatsApp session and phone-number pairing.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   inputs.cattle.url = "git+https://github.com/charlesbaynham/nix-proxmox-cattle?ref=v1";
@@ -7,6 +7,7 @@
   outputs = { self, nixpkgs, cattle }:
     let
       system = "x86_64-linux";
+      lib = nixpkgs.lib;
       pkgs = nixpkgs.legacyPackages.${system};
 
       # go.mod wants go >= 1.26.8; this pin's default `go` is 1.26.7.
@@ -20,20 +21,41 @@
 
       # nixos-26.05 already carries mcp 1.26.0 (>=1.10,<2), so no overlay.
       mcpEnv = pkgs.python3.withPackages (ps: [ ps.mcp ps.requests ps.httpx ]);
+
+      # The module carries no per-account state (nix/whatsapp.nix), so a second
+      # WhatsApp account is just a second template under a different name -
+      # everything that makes it a separate account (the session, the message
+      # mirror) lives on the container's own state volume, not in this image.
+      mkWhatsapp = name: cattle.lib.mkTemplate {
+        inherit nixpkgs system name;
+        stateDir = "/data";
+        modules = [
+          ./nix/whatsapp.nix
+          {
+            services.whatsapp = {
+              enable = true;
+              inherit bridge mcpEnv;
+              mcpSource = ./whatsapp-mcp-server;
+            };
+          }
+        ];
+      };
+
+      templates = {
+        whatsapp = mkWhatsapp "whatsapp";
+        "charlesbot-whatsapp" = mkWhatsapp "charlesbot-whatsapp";
+      };
     in
-    cattle.lib.mkTemplate {
-      inherit nixpkgs system;
-      name = "whatsapp";
-      stateDir = "/data";
-      modules = [
-        ./nix/whatsapp.nix
-        {
-          services.whatsapp = {
-            enable = true;
-            inherit bridge mcpEnv;
-            mcpSource = ./whatsapp-mcp-server;
-          };
-        }
-      ];
+    {
+      nixosConfigurations =
+        lib.foldl' lib.recursiveUpdate { } (map (t: t.nixosConfigurations) (lib.attrValues templates));
+
+      # One attribute per service, named for it. mkTemplate calls every
+      # template's own output `proxmoxLxcTemplate`, which cannot tell two of
+      # them apart, so CI passes `attr: <service>`. The name must equal the
+      # registry key in homelab-infra's services.yaml: it also becomes the
+      # template filename prefix the deployer selects release assets by.
+      packages.${system} =
+        lib.mapAttrs (_: t: t.packages.${system}.proxmoxLxcTemplate) templates;
     };
 }
