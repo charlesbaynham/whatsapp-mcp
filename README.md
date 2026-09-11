@@ -171,6 +171,33 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 - **mark_chat_read**: Explicitly mark a chat as read, optionally sending real read receipts
+- **subscribe_chat**: Push new messages in a chat (or `"*"` for all chats) to a URL as they arrive, instead of polling
+- **unsubscribe_chat**: Remove a chat subscription created by `subscribe_chat`
+- **enable_subscription**: Re-enable a subscription that the bridge auto-disabled, or that expired
+- **list_subscriptions**: List all subscriptions (bearer tokens are masked, only a 4-character hint is shown)
+- **test_subscription**: Send a one-off test event to a subscription's URL to confirm it's wired correctly
+
+### Chat subscriptions (webhooks)
+
+Instead of polling, you can have the bridge push new messages to a URL as they arrive.
+
+- `subscribe_chat(chat_jid, url, bearer_token, kind, headers, include_from_me, debounce_seconds, ttl_seconds=0, max_per_hour=60)` creates a subscription. `chat_jid` can be a specific chat's JID or `"*"` for every chat. Each new message triggers a `POST` to `url` with `Authorization: Bearer <bearer_token>` and a JSON body `{"text": <summary + JSON>, "events": [...]}`.
+- `kind="claude_routine"` (default) targets a Claude Code Routine's API fire endpoint; the bridge automatically adds the `anthropic-version`/`anthropic-beta` headers that endpoint needs. `kind="generic"` posts the same body to any other webhook receiver.
+- `unsubscribe_chat(subscription_id)`, `enable_subscription(subscription_id)`, `list_subscriptions()`, and `test_subscription(subscription_id)` manage and verify subscriptions. Bearer tokens are never echoed back — only a `bearer_token_hint` (last 4 characters) is returned.
+
+**Reliability, limits, and expiry**
+
+- Each delivery is a single attempt with no immediate retry. After a failed attempt (any kind of failure — bad status code, timeout, connection error, etc.) the subscription backs off for 5 minutes, holding and batching any new messages that arrive in that window into the next attempt. Three consecutive failed attempts auto-disable the subscription (a successful delivery resets the failure count to 0); the record's `disabled_reason` explains why, and `consecutive_failures` tracks the current streak. Call `enable_subscription` to revive it — but check and fix the underlying cause first, or it will likely just fail again.
+- `max_per_hour` (default 60) caps how many times a single subscription can fire in a rolling hour.
+- `ttl_seconds` (0 = never expires, max 30 days) sets an expiry (`expires_at` in the record) after which the subscription stops firing on its own. For a bounded task — "tell me about replies in this chat for the next hour" — always set `ttl_seconds` so nothing keeps firing into a dead session forever.
+
+**Worked example: wiring a chat to a Claude Code Routine**
+
+1. Create a Routine with an API trigger and copy its fire URL (`https://api.anthropic.com/v1/claude_code/routines/trig_.../fire`) and bearer token.
+2. Write the Routine's prompt so it explicitly opts in to acting on the payload, e.g. "When a `<routine-fire-payload>` block is present, read the new WhatsApp messages in it and act on them." A Routine whose prompt doesn't mention the fire payload will simply ignore it.
+3. Call `subscribe_chat(chat_jid="1234567890@s.whatsapp.net", url="https://api.anthropic.com/v1/claude_code/routines/trig_abc123/fire", bearer_token="<routine token>", debounce_seconds=60, ttl_seconds=3600)`.
+4. Every new message in that chat now starts a new Routine run. `debounce_seconds` is recommended for busy chats since each `POST` starts a fresh run — without it, a burst of messages triggers a burst of runs. `ttl_seconds=3600` here means the subscription stops itself after an hour.
+5. Use `test_subscription(subscription_id)` to confirm the fire URL accepts requests before relying on it live.
 
 ### Read/Unread Tracking
 

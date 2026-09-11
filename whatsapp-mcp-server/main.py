@@ -22,6 +22,11 @@ from whatsapp import (
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
+    subscribe_chat as whatsapp_subscribe_chat,
+    unsubscribe_chat as whatsapp_unsubscribe_chat,
+    enable_subscription as whatsapp_enable_subscription,
+    list_subscriptions as whatsapp_list_subscriptions,
+    test_subscription as whatsapp_test_subscription,
     message_to_dict,
     chat_to_dict,
     contact_to_dict,
@@ -324,6 +329,167 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def subscribe_chat(
+    chat_jid: str,
+    url: str,
+    bearer_token: str = "",
+    kind: str = "claude_routine",
+    headers: Optional[Dict[str, str]] = None,
+    include_from_me: bool = False,
+    debounce_seconds: int = 0,
+    ttl_seconds: int = 0,
+    max_per_hour: int = 60,
+) -> Dict[str, Any]:
+    """Push new WhatsApp messages in a chat to a URL as they arrive, instead of polling.
+
+    Once subscribed, every new incoming message in the chat (and outgoing
+    messages too, if include_from_me=True) causes the bridge to POST a JSON
+    body ({"text": <human-readable summary + JSON>, "events": [...]}) with
+    an `Authorization: Bearer <bearer_token>` header to `url`.
+
+    Two kinds of target:
+    - kind="claude_routine" (default): wire this to a Claude Code Routine's
+      API fire endpoint, e.g.
+      https://api.anthropic.com/v1/claude_code/routines/trig_.../fire
+      Paste that fire URL as `url` and the routine's trigger bearer token as
+      `bearer_token`. The bridge automatically adds the anthropic-version and
+      anthropic-beta headers the fire endpoint requires, so you don't need to
+      pass those in `headers`. IMPORTANT: the routine's own prompt must
+      explicitly opt in to acting on the <routine-fire-payload> block it
+      receives (e.g. "when a <routine-fire-payload> is present, read the new
+      WhatsApp messages in it and act on them") -- a routine whose prompt
+      doesn't mention the fire payload will ignore it. Also note that every
+      POST starts a brand-new routine run, so for a busy chat set
+      debounce_seconds (e.g. 30-120) to avoid firing a run per message.
+    - kind="generic": POSTs the same body to any other URL/webhook receiver,
+      using `headers` for any extra headers it needs beyond the bearer token.
+
+    chat_jid may be a specific chat's JID, or "*" to subscribe to messages
+    across all chats.
+
+    Reliability and limits:
+    - Each delivery is a single attempt -- there is no immediate retry. After
+      a failed attempt (any failure type: bad status code, timeout, connection
+      error, etc.) the subscription backs off for 5 minutes, holding and
+      batching any new messages that arrive in the meantime into the next
+      attempt. Three consecutive failed attempts auto-disable the
+      subscription; any successful delivery resets the failure count back to
+      0. A disabled subscription's record shows disabled_reason explaining
+      why, and it stops firing until you call enable_subscription to revive
+      it.
+    - max_per_hour caps how many times this subscription can fire in a
+      rolling hour, so a very busy chat can't run away with your quota.
+    - ttl_seconds (0 = never expires, max 30 days) sets an expiry after which
+      the subscription stops firing on its own. For a bounded task (e.g. "let
+      me know about replies in this chat for the next hour") always set
+      ttl_seconds so nothing keeps firing into a dead session forever.
+
+    Args:
+        chat_jid: The JID of the chat to watch, or "*" for all chats
+        url: The endpoint to POST new-message events to
+        bearer_token: Sent as `Authorization: Bearer <token>`. Never echoed back
+                 by list_subscriptions or this call's response -- store it yourself
+                 if you need it again.
+        kind: "claude_routine" (default) or "generic"
+        headers: Optional extra headers to send with each POST
+        include_from_me: Whether to also fire for messages you sent (default False)
+        debounce_seconds: Minimum gap between fires for this subscription; recommended
+                 for busy chats so a burst of messages triggers one fire, not many
+        ttl_seconds: How long this subscription stays active, in seconds (0 = no
+                 expiry, max 30 days = 2592000). Recommended for bounded tasks.
+        max_per_hour: Maximum number of fires allowed per rolling hour (default 60)
+
+    Returns:
+        A dictionary with success status, a message, and (on success) the created
+        subscription record (with the bearer token masked)
+    """
+    return whatsapp_subscribe_chat(
+        chat_jid,
+        url,
+        bearer_token=bearer_token,
+        kind=kind,
+        headers=headers,
+        include_from_me=include_from_me,
+        debounce_seconds=debounce_seconds,
+        ttl_seconds=ttl_seconds,
+        max_per_hour=max_per_hour,
+    )
+
+@mcp.tool()
+def unsubscribe_chat(subscription_id: int) -> Dict[str, Any]:
+    """Remove a chat subscription created by subscribe_chat, stopping further pushes.
+
+    Args:
+        subscription_id: The id of the subscription to remove (from subscribe_chat
+                 or list_subscriptions)
+
+    Returns:
+        A dictionary with success status and a message
+    """
+    return whatsapp_unsubscribe_chat(subscription_id)
+
+@mcp.tool()
+def enable_subscription(subscription_id: int) -> Dict[str, Any]:
+    """Re-enable a subscription that the bridge auto-disabled (e.g. after 3
+    consecutive delivery failures) or that has expired.
+
+    Use list_subscriptions first to check disabled_reason and confirm why it
+    was disabled before reviving it -- if the underlying problem (bad URL,
+    revoked token, expired ttl) isn't fixed, it will likely just fail again.
+
+    Args:
+        subscription_id: The id of the subscription to re-enable
+
+    Returns:
+        A dictionary with success status, a message, and (on success) the
+        updated subscription record
+    """
+    return whatsapp_enable_subscription(subscription_id)
+
+@mcp.tool()
+def list_subscriptions() -> List[Dict[str, Any]]:
+    """List all active and inactive chat subscriptions (webhooks).
+
+    Bearer tokens are never returned -- each record instead includes
+    bearer_token_hint (the last 4 characters) so you can recognize which
+    subscription is which without exposing the secret.
+
+    Each delivery is a single attempt with no immediate retry; after a failed
+    attempt the subscription backs off for 5 minutes (batching any new
+    messages into the next attempt) before trying again. The bridge
+    auto-disables a subscription after 3 consecutive failed attempts (any
+    failure type counts; a success resets the counter back to 0), or once it
+    passes its expires_at (if ttl_seconds was set). Check enabled,
+    disabled_reason, and consecutive_failures to see subscription health, and
+    expires_at / max_per_hour for its limits. Use enable_subscription to
+    revive a disabled subscription.
+
+    Returns:
+        A list of subscription records: id, chat_jid, url, bearer_token_hint,
+        kind, headers, include_from_me, debounce_seconds, max_per_hour,
+        enabled, disabled_reason, consecutive_failures, expires_at,
+        created_at, last_fired_at, last_status, last_error
+    """
+    return whatsapp_list_subscriptions()
+
+@mcp.tool()
+def test_subscription(subscription_id: int) -> Dict[str, Any]:
+    """Send a one-off test event to a subscription's URL to verify it's wired correctly.
+
+    Useful after subscribe_chat to confirm the URL and bearer token actually
+    work (e.g. that a Claude Code Routine fire URL accepts the request) before
+    relying on it for live messages.
+
+    Args:
+        subscription_id: The id of the subscription to test
+
+    Returns:
+        A dictionary with success status, the HTTP status code returned by the
+        target URL, and an error message if it failed
+    """
+    return whatsapp_test_subscription(subscription_id)
 
 if __name__ == "__main__":
     # Initialize and run the server
