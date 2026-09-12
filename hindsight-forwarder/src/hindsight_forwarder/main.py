@@ -20,6 +20,8 @@ Configuration (environment):
   HINDSIGHT_CONTEXT_EXTRA  Sentence appended to every generated context
   FORWARDER_OWNER_NAME     How the account owner is named in transcripts (default: Me)
   FORWARDER_ACCOUNT_LABEL  Which WhatsApp account this is, named in the context
+  FORWARDER_ACCOUNT        Slug for the same account, tagged as account:<slug>
+  FORWARDER_TAGS           Extra comma-separated tags on every memory
   FORWARDER_CHATS          Comma-separated chat JIDs to forward; empty = every chat
   FORWARDER_INCLUDE_FROM_ME  Forward your own messages too (default: true)
   FORWARDER_STATE_DIR      Where the cursor and per-chat open documents live
@@ -56,6 +58,8 @@ class Config:
     context_extra: str = ""
     owner_name: str = "Me"
     account_label: str = ""
+    account: str = ""
+    extra_tags: List[str] = field(default_factory=list)
     chats: Set[str] = field(default_factory=set)
     include_from_me: bool = True
     state_dir: Path = Path(".")
@@ -71,6 +75,8 @@ class Config:
             context_extra=env.get("HINDSIGHT_CONTEXT_EXTRA", "").strip(),
             owner_name=env.get("FORWARDER_OWNER_NAME", "Me").strip() or "Me",
             account_label=env.get("FORWARDER_ACCOUNT_LABEL", "").strip(),
+            account=env.get("FORWARDER_ACCOUNT", "").strip(),
+            extra_tags=[t.strip() for t in env.get("FORWARDER_TAGS", "").split(",") if t.strip()],
             chats=chats,
             include_from_me=env.get("FORWARDER_INCLUDE_FROM_ME", "true").lower() not in ("0", "false", "no"),
             state_dir=Path(env.get("FORWARDER_STATE_DIR") or env.get("STATE_DIRECTORY") or "."),
@@ -79,6 +85,19 @@ class Config:
     @property
     def retain_url(self) -> str:
         return self.hindsight_url + self.retain_path.format(bank=self.bank)
+
+    def tags_for(self, chat_jid: str) -> List[str]:
+        """Every memory says where it came from, at three widths.
+
+        A bank shared with other sources needs the source itself tagged, not
+        just described: recall filters on tags, and metadata does not filter.
+        """
+        tags = ["source:whatsapp"]
+        if self.account:
+            tags.append(f"account:{self.account}")
+        tags.extend(self.extra_tags)
+        tags.append(f"chat:{chat_jid}")
+        return tags
 
 
 class State:
@@ -222,10 +241,11 @@ def retain_item(cfg: Config, ev: Event, document: str, opened: bool) -> Dict[str
             "chat_name": str(msg.get("chat_name") or ""),
             "sender": str(msg.get("sender") or ""),
             "message_id": str(msg.get("message_id") or ""),
+            "account": cfg.account,
             "media_type": str(msg.get("media_type") or ""),
             "event_id": str(ev.id),
         },
-        "tags": ["source:whatsapp", f"chat:{msg.get('chat_jid')}"],
+        "tags": cfg.tags_for(str(msg.get("chat_jid") or "")),
     }
     if not opened:
         item["update_mode"] = "append"

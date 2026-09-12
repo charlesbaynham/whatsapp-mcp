@@ -15,6 +15,13 @@ that it is given everything.
   "append"`, which reprocesses only the new chunk) rather than retained as a
   standalone memory. "Yes, book it" means nothing on its own and everything
   after the message before it.
+- **Every memory is tagged with where it came from**, at three widths:
+  `source:whatsapp`, `account:<slug>` (`FORWARDER_ACCOUNT`, so two bridges
+  sharing a bank stay distinguishable) and `chat:<jid>`, plus anything in
+  `FORWARDER_TAGS`. Tags are what recall filters on; metadata is carried
+  alongside but does not filter. Recall's default `tags_match` is `any`,
+  which also returns *untagged* memories — pass `any_strict` to get WhatsApp
+  and nothing else.
 - **`context` names the participants**, because Hindsight injects it straight
   into the extraction prompt: *"WhatsApp conversation on Charles's personal
   WhatsApp account between Charles and Gaby. Each line is `[date time]

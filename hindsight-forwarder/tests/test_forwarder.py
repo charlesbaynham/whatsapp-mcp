@@ -26,11 +26,14 @@ class ConfigTests(unittest.TestCase):
     def test_from_env(self):
         cfg = Config.from_env({"HINDSIGHT_URL": "https://h/", "HINDSIGHT_BANK": "b",
                                "FORWARDER_CHATS": "a@s.whatsapp.net, g@g.us", "FORWARDER_INCLUDE_FROM_ME": "false",
-                               "FORWARDER_OWNER_NAME": "Charles", "STATE_DIRECTORY": "/var/lib/x"})
+                               "FORWARDER_OWNER_NAME": "Charles", "FORWARDER_ACCOUNT": "charles-personal",
+                               "FORWARDER_TAGS": "person:charles, home", "STATE_DIRECTORY": "/var/lib/x"})
         self.assertEqual(cfg.retain_url, "https://h/v1/default/banks/b/memories")
         self.assertEqual(cfg.chats, {"a@s.whatsapp.net", "g@g.us"})
         self.assertFalse(cfg.include_from_me)
         self.assertEqual(cfg.owner_name, "Charles")
+        self.assertEqual(cfg.tags_for("c@g.us"),
+                         ["source:whatsapp", "account:charles-personal", "person:charles", "home", "chat:c@g.us"])
         self.assertEqual(cfg.state_dir, Path("/var/lib/x"))
 
 
@@ -111,6 +114,10 @@ class RetainItemTests(unittest.TestCase):
         self.assertEqual(item["timestamp"], "2026-09-12T10:00:00Z")
         self.assertEqual(item["metadata"]["event_id"], "9")
         self.assertEqual(item["tags"], ["source:whatsapp", "chat:c@s.whatsapp.net"])
+        tagged = forwarding_config(account="charlesbot")
+        item = retain_item(tagged, ev(9), document, opened)
+        self.assertEqual(item["tags"], ["source:whatsapp", "account:charlesbot", "chat:c@s.whatsapp.net"])
+        self.assertEqual(item["metadata"]["account"], "charlesbot")
         self.assertEqual(retain_item(cfg, ev(10), document, False)["update_mode"], "append")
 
 
