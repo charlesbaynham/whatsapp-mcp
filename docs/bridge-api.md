@@ -70,7 +70,7 @@ pass), `types` (comma-separated), `include_from_me` (default false).
 
 | Event | Data | When |
 | --- | --- | --- |
-| `message.new` | message (`message_id, chat_jid, chat_name, sender, content, timestamp, is_from_me, media_type?, filename?, has_media, transcript?, transcription_status?, duration_seconds?`) | A message became publishable. A voice note is published once, after transcription (or after the transcription timeout), never as media first and text later. |
+| `message.new` | message (`message_id, chat_jid, chat_name, sender, sender_name, content, timestamp, is_from_me, media_type?, filename?, has_media, transcript?, transcription_status?, duration_seconds?`) | A message became publishable. A voice note is published once, after transcription (or after the transcription timeout), never as media first and text later. |
 | `message.updated` | same | An on-demand transcription finished |
 | `chat.read` | `{chat_jid, up_to, source: api\|receipt\|app_state}` | Read marker advanced |
 | `bridge.status` | `{connected, logged_in, jid?}` | Connection state changed |
