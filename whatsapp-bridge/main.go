@@ -871,10 +871,11 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, addr string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
+	registerReadRoutes(mux, messageStore)
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		jid := ""
@@ -1116,11 +1117,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 		json.NewEncoder(w).Encode(resp)
 	})
 
-	server := &http.Server{Addr: addr, Handler: mux}
+	server := &http.Server{Handler: mux}
+	ln, err := listenAddr(addr, socketGroup)
+	if err != nil {
+		logger.Errorf("Failed to listen on %s: %v", addr, err)
+		os.Exit(1)
+	}
 	fmt.Printf("Starting REST API server on %s...\n", addr)
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -1133,6 +1139,7 @@ func main() {
 
 	storeDir := getEnvOrDefault("WHATSAPP_STORE_DIR", "store")
 	bridgeAddr := getEnvOrDefault("WHATSAPP_BRIDGE_ADDR", "127.0.0.1:8080")
+	socketGroup := os.Getenv("WHATSAPP_BRIDGE_SOCKET_GROUP")
 	logBodies := os.Getenv("WHATSAPP_LOG_MESSAGE_BODIES") == "1"
 
 	// Set up logger
@@ -1210,7 +1217,7 @@ func main() {
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, dispatcher, bridgeAddr, logBodies, logger)
+	server := startRESTServer(client, messageStore, dispatcher, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {
