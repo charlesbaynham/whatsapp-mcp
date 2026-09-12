@@ -1,11 +1,17 @@
 [project]
 name = "whatsapp-mcp-server"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "MCP server exposing a whatsapp-bridge instance to an LLM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.10.0,<2",
-    "requests>=2.32.3",
+    "whatsapp-client",
 ]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+whatsapp-client = { workspace = true }

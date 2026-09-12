@@ -20,7 +20,8 @@
       };
 
       # nixos-26.05 already carries mcp 1.26.0 (>=1.10,<2), so no overlay.
-      mcpEnv = pkgs.python3.withPackages (ps: [ ps.mcp ps.requests ps.httpx ]);
+      # whatsapp-client itself is put on PYTHONPATH from source by the module.
+      pythonEnv = pkgs.python3.withPackages (ps: [ ps.mcp ps.httpx ]);
 
       # The module carries no per-account state (nix/whatsapp.nix), so a second
       # WhatsApp account is just a second template under a different name -
@@ -34,7 +35,8 @@
           {
             services.whatsapp = {
               enable = true;
-              inherit bridge mcpEnv;
+              inherit bridge pythonEnv;
+              clientSource = ./whatsapp-client;
               mcpSource = ./whatsapp-mcp-server;
             };
           }

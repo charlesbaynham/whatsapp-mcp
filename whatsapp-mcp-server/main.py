@@ -1,44 +1,39 @@
-import os
+"""WhatsApp MCP server: MCP tools over the whatsapp-bridge REST API.
 
-import httpx
+This process is a thin client. It never opens the message database, never
+touches the store directory and never runs ffmpeg; the bridge does all of
+that behind its Unix socket (or TCP loopback port on a laptop).
+"""
+
+import os
+from typing import Any, Dict, List, Optional
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
-from whatsapp import (
-    WHATSAPP_API_BASE_URL,
-    search_contacts as whatsapp_search_contacts,
-    list_messages as whatsapp_list_messages,
-    list_chats as whatsapp_list_chats,
-    list_unread_chats as whatsapp_list_unread_chats,
-    mark_chat_read as whatsapp_mark_chat_read,
-    get_chat as whatsapp_get_chat,
-    get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
-    get_contact_chats as whatsapp_get_contact_chats,
-    get_last_interaction as whatsapp_get_last_interaction,
-    get_message_context as whatsapp_get_message_context,
-    send_message as whatsapp_send_message,
-    send_file as whatsapp_send_file,
-    send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media,
-    subscribe_chat as whatsapp_subscribe_chat,
-    unsubscribe_chat as whatsapp_unsubscribe_chat,
-    enable_subscription as whatsapp_enable_subscription,
-    list_subscriptions as whatsapp_list_subscriptions,
-    test_subscription as whatsapp_test_subscription,
-    message_to_dict,
-    chat_to_dict,
-    contact_to_dict,
-    message_context_to_dict,
-)
+from whatsapp_client import BridgeError, BridgeUnavailable, WhatsAppClient
 
 MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 
-# Initialize FastMCP server
+# Laptop default is the bridge's TCP loopback port; the hosted deployment sets
+# WHATSAPP_BRIDGE_URL=unix:/run/whatsapp/bridge.sock.
+wa = WhatsAppClient(os.environ.get("WHATSAPP_BRIDGE_URL", "http://127.0.0.1:8080"))
+
 mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
+
+
+def _result(call, **extra: Any) -> Dict[str, Any]:
+    """Run a bridge call and fold any error into a {success, message} dict."""
+    try:
+        out = call()
+    except BridgeError as e:
+        return {"success": False, "message": str(e), **extra}
+    if isinstance(out, dict):
+        return out
+    return {"success": True, "message": "ok", **extra}
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -51,28 +46,25 @@ async def health(_request: Request) -> JSONResponse:
     healthy here rather than triggering a destroy/recreate loop.
     """
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{WHATSAPP_API_BASE_URL}/status")
-        resp.raise_for_status()
-        status = resp.json()
-    except Exception as e:
+        status = wa.status()
+    except BridgeError as e:
         return JSONResponse({"status": "error", "reason": f"bridge unreachable: {e}"}, status_code=503)
-
     return JSONResponse({
         "status": "ok",
         "paired": bool(status.get("logged_in")),
         "connected": bool(status.get("connected")),
     })
 
+
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
-    
+
     Args:
         query: Search term to match against contact names or phone numbers
     """
-    contacts = whatsapp_search_contacts(query)
-    return [contact_to_dict(c) for c in contacts]
+    return wa.search_contacts(query)
+
 
 @mcp.tool()
 def list_messages(
@@ -88,7 +80,12 @@ def list_messages(
     context_after: int = 1
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp messages matching specified criteria with optional context.
-    
+
+    Voice notes carry the spoken text in `transcript` (with
+    `transcription_status`) while `content` stays as WhatsApp delivered it,
+    so the two are distinguishable; the audio itself is fetchable via
+    download_media.
+
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
@@ -101,19 +98,12 @@ def list_messages(
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
     """
-    messages = whatsapp_list_messages(
-        after=after,
-        before=before,
-        sender_phone_number=sender_phone_number,
-        chat_jid=chat_jid,
-        query=query,
-        limit=limit,
-        page=page,
-        include_context=include_context,
-        context_before=context_before,
-        context_after=context_after
+    return wa.list_messages(
+        after=after, before=before, sender=sender_phone_number, chat_jid=chat_jid, query=query,
+        limit=limit, page=page, include_context=include_context,
+        context_before=context_before, context_after=context_after,
     )
-    return [message_to_dict(m) for m in messages]
+
 
 @mcp.tool()
 def list_chats(
@@ -134,15 +124,9 @@ def list_chats(
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
         unread_only: If True, only return chats that have unread incoming messages (default False)
     """
-    chats = whatsapp_list_chats(
-        query=query,
-        limit=limit,
-        page=page,
-        include_last_message=include_last_message,
-        sort_by=sort_by,
-        unread_only=unread_only
-    )
-    return [chat_to_dict(c) for c in chats]
+    return wa.list_chats(query=query, limit=limit, page=page, include_last_message=include_last_message,
+                         sort_by=sort_by, unread_only=unread_only)
+
 
 @mcp.tool()
 def list_unread_chats(limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -152,8 +136,8 @@ def list_unread_chats(limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
-    chats = whatsapp_list_unread_chats(limit, page)
-    return [chat_to_dict(c) for c in chats]
+    return wa.list_unread_chats(limit, page)
+
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Dict[str, Any]]:
@@ -163,8 +147,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Dict[
         chat_jid: The JID of the chat to retrieve
         include_last_message: Whether to include the last message (default True)
     """
-    chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat_to_dict(chat) if chat else None
+    return wa.get_chat(chat_jid, include_last_message)
+
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Dict[str, Any]]:
@@ -173,8 +157,8 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Dict[str, A
     Args:
         sender_phone_number: The phone number to search for
     """
-    chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat_to_dict(chat) if chat else None
+    return wa.get_direct_chat_by_phone(sender_phone_number)
+
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -185,34 +169,43 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
-    chats = whatsapp_get_contact_chats(jid, limit, page)
-    return [chat_to_dict(c) for c in chats]
+    return wa.get_contact_chats(jid, limit, page)
+
 
 @mcp.tool()
-def get_last_interaction(jid: str) -> str:
+def get_last_interaction(jid: str) -> Optional[str]:
     """Get most recent WhatsApp message involving the contact.
-    
+
     Args:
         jid: The JID of the contact to search for
     """
-    message = whatsapp_get_last_interaction(jid)
-    return message
+    msg = wa.get_last_interaction(jid)
+    if msg is None:
+        return None
+    prefix = ""
+    if msg.get("media_type"):
+        prefix = f"[{msg['media_type']} - Message ID: {msg['id']} - Chat JID: {msg['chat_jid']}] "
+    body = msg.get("content") or ""
+    if msg.get("transcript"):
+        body = f"[voice note] {msg['transcript']}"
+    return f"[{msg['timestamp']}] Chat: {msg.get('chat_name') or msg['chat_jid']} From: {msg['sender_name']}: {prefix}{body}\n"
+
 
 @mcp.tool()
 def get_message_context(
     message_id: str,
     before: int = 5,
     after: int = 5
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """Get context around a specific WhatsApp message.
-    
+
     Args:
         message_id: The ID of the message to get context for
         before: Number of messages to include before the target message (default 5)
         after: Number of messages to include after the target message (default 5)
     """
-    context = whatsapp_get_message_context(message_id, before, after)
-    return message_context_to_dict(context)
+    return wa.get_message_context(message_id, before, after)
+
 
 @mcp.tool()
 def send_message(
@@ -225,23 +218,14 @@ def send_message(
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
-    # Validate input
     if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
-    
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "message": status_message
-    }
+        return {"success": False, "message": "Recipient must be provided"}
+    return _result(lambda: wa.send_message(recipient, message))
+
 
 @mcp.tool()
 def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
@@ -262,73 +246,67 @@ def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
         A dictionary with success status, a status message, marked_count (how many
         messages were marked read), and receipt_sent (whether a receipt was sent)
     """
-    return whatsapp_mark_chat_read(chat_jid, send_receipt)
+    if not chat_jid:
+        return {"success": False, "message": "chat_jid must be provided", "marked_count": 0, "receipt_sent": False}
+    return _result(lambda: wa.mark_chat_read(chat_jid, send_receipt), marked_count=0, receipt_sent=False)
+
 
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document). Must be
-                 inside the WhatsApp store directory, e.g. a path returned by download_media.
+        media_path: The absolute path to the media file to send (image, video, document). Either a
+                 file this server can read (it is uploaded to the bridge) or a path inside the
+                 bridge's store directory, e.g. one returned by download_media.
 
     Returns:
         A dictionary containing success status and a status message
     """
+    if not recipient or not media_path:
+        return {"success": False, "message": "recipient and media_path must be provided"}
+    return _result(lambda: wa.send_file(recipient, path=media_path))
 
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
 
 @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+    """Send any audio file as a WhatsApp voice message to the specified recipient. For group messages use the JID. The bridge converts it to Opus .ogg with ffmpeg if needed; if that fails, use send_file instead.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's
-                 not a .ogg file). Must be inside the WhatsApp store directory, e.g. a path returned by
-                 download_media.
+        media_path: The absolute path to the audio file to send. Either a file this server can read
+                 (it is uploaded to the bridge) or a path inside the bridge's store directory.
 
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    if not recipient or not media_path:
+        return {"success": False, "message": "recipient and media_path must be provided"}
+    return _result(lambda: wa.send_file(recipient, path=media_path, voice_note=True))
+
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
-    
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-    
-    if file_path:
-        return {
-            "success": True,
-            "message": "Media downloaded successfully",
-            "file_path": file_path
-        }
-    else:
-        return {
-            "success": False,
-            "message": "Failed to download media"
-        }
+    try:
+        out = wa.download_media(message_id, chat_jid)
+    except BridgeError as e:
+        return {"success": False, "message": f"Failed to download media: {e}"}
+    if out.get("success"):
+        return {"success": True, "message": "Media downloaded successfully", "file_path": out.get("path")}
+    return {"success": False, "message": out.get("message", "Failed to download media")}
+
 
 @mcp.tool()
 def subscribe_chat(
@@ -347,7 +325,8 @@ def subscribe_chat(
     Once subscribed, every new incoming message in the chat (and outgoing
     messages too, if include_from_me=True) causes the bridge to POST a JSON
     body ({"text": <human-readable summary + JSON>, "events": [...]}) with
-    an `Authorization: Bearer <bearer_token>` header to `url`.
+    an `Authorization: Bearer <bearer_token>` header to `url`. Voice notes
+    are delivered once, after transcription, with the transcript inline.
 
     Two kinds of target:
     - kind="claude_routine" (default): wire this to a Claude Code Routine's
@@ -405,17 +384,22 @@ def subscribe_chat(
         A dictionary with success status, a message, and (on success) the created
         subscription record (with the bearer token masked)
     """
-    return whatsapp_subscribe_chat(
-        chat_jid,
-        url,
-        bearer_token=bearer_token,
-        kind=kind,
-        headers=headers,
-        include_from_me=include_from_me,
-        debounce_seconds=debounce_seconds,
-        ttl_seconds=ttl_seconds,
-        max_per_hour=max_per_hour,
-    )
+    if not chat_jid or not url:
+        return {"success": False, "message": "chat_jid and url must be provided"}
+    try:
+        sub = wa.create_webhook(
+            chat_jid=chat_jid, url=url, bearer_token=bearer_token, kind=kind, headers=headers or {},
+            include_from_me=include_from_me, debounce_seconds=debounce_seconds,
+            ttl_seconds=ttl_seconds, max_per_hour=max_per_hour)
+    except BridgeError as e:
+        return {"success": False, "message": str(e)}
+    return {"success": True, "message": "Subscription created", "subscription": _mask(sub)}
+
+
+def _mask(sub: Dict[str, Any]) -> Dict[str, Any]:
+    """Never surface the raw bearer token, even if a future bridge echoed it."""
+    return {k: v for k, v in sub.items() if k != "bearer_token"}
+
 
 @mcp.tool()
 def unsubscribe_chat(subscription_id: int) -> Dict[str, Any]:
@@ -428,7 +412,14 @@ def unsubscribe_chat(subscription_id: int) -> Dict[str, Any]:
     Returns:
         A dictionary with success status and a message
     """
-    return whatsapp_unsubscribe_chat(subscription_id)
+    try:
+        wa.delete_webhook(subscription_id)
+    except BridgeError as e:
+        if e.status == 404:
+            return {"success": False, "message": f"Subscription {subscription_id} not found"}
+        return {"success": False, "message": str(e)}
+    return {"success": True, "message": "Subscription deleted"}
+
 
 @mcp.tool()
 def enable_subscription(subscription_id: int) -> Dict[str, Any]:
@@ -446,7 +437,14 @@ def enable_subscription(subscription_id: int) -> Dict[str, Any]:
         A dictionary with success status, a message, and (on success) the
         updated subscription record
     """
-    return whatsapp_enable_subscription(subscription_id)
+    try:
+        sub = wa.enable_webhook(subscription_id)
+    except BridgeError as e:
+        if e.status == 404:
+            return {"success": False, "message": f"Subscription {subscription_id} not found"}
+        return {"success": False, "message": str(e)}
+    return {"success": True, "message": "Subscription enabled", "subscription": _mask(sub)}
+
 
 @mcp.tool()
 def list_subscriptions() -> List[Dict[str, Any]]:
@@ -472,7 +470,11 @@ def list_subscriptions() -> List[Dict[str, Any]]:
         enabled, disabled_reason, consecutive_failures, expires_at,
         created_at, last_fired_at, last_status, last_error
     """
-    return whatsapp_list_subscriptions()
+    try:
+        return [_mask(s) for s in wa.list_webhooks()]
+    except BridgeError:
+        return []
+
 
 @mcp.tool()
 def test_subscription(subscription_id: int) -> Dict[str, Any]:
@@ -489,7 +491,13 @@ def test_subscription(subscription_id: int) -> Dict[str, Any]:
         A dictionary with success status, the HTTP status code returned by the
         target URL, and an error message if it failed
     """
-    return whatsapp_test_subscription(subscription_id)
+    try:
+        return wa.test_webhook(subscription_id)
+    except BridgeError as e:
+        if e.status == 404:
+            return {"success": False, "message": f"Subscription {subscription_id} not found"}
+        return {"success": False, "error": str(e)}
+
 
 if __name__ == "__main__":
     # Initialize and run the server
