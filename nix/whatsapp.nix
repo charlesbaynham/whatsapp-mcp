@@ -31,6 +31,8 @@ let
     RestrictNamespaces = true;
     SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
     SystemCallArchitectures = "native";
+    # Cores land in WorkingDirectory, i.e. the state volume and the nightly backup.
+    LimitCORE = 0;
     CapabilityBoundingSet = "";
     AmbientCapabilities = "";
     UMask = "0077";
@@ -236,6 +238,10 @@ in
           ReadWritePaths = [ storeDir ];
           RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
           WorkingDirectory = storeDir;
+          # @chown sits inside @privileged, which the shared filter subtracts:
+          # without re-adding it the bridge is SIGSYS-killed the instant it
+          # chgrps its socket to the clients group.
+          SystemCallFilter = hardening.SystemCallFilter ++ [ "@chown" ];
           # buildGoModule names the binary after go.mod's module path.
           ExecStart = "${cfg.bridge}/bin/whatsapp-client";
           Restart = "always";
