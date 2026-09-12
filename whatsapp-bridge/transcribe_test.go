@@ -170,6 +170,20 @@ func TestTranscribeRestartRequeuesPending(t *testing.T) {
 	}
 }
 
+func TestReleasePendingWhenDisabled(t *testing.T) {
+	store, pub, _ := newTranscribeFixture(t, nil)
+	store.markTranscriptionPending("c@s.whatsapp.net", "v1")
+	off := NewTranscriber(TranscriberConfig{Enabled: false}, store, pub, waLog.Noop)
+	off.ReleasePending()
+	_, msg := lastEvent(t, store, 0)
+	if msg.TranscriptionStatus != transcriptionDisabled {
+		t.Errorf("%+v", msg)
+	}
+	if left, _ := store.pendingTranscriptions(); len(left) != 0 {
+		t.Errorf("still pending: %+v", left)
+	}
+}
+
 func TestEnsureColumnIsIdempotent(t *testing.T) {
 	store := newTestStore(t)
 	for i := 0; i < 2; i++ {

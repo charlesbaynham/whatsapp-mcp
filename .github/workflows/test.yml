@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+      - run: go vet ./... && go test ./...
+        working-directory: whatsapp-bridge
+      - run: test -z "$(gofmt -l .)"
+        working-directory: whatsapp-bridge
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-packages --frozen
+      - run: uv run --package whatsapp-client python -m unittest discover -s whatsapp-client/tests
+      - run: uv run --package hindsight-forwarder python -m unittest discover -s hindsight-forwarder/tests
+      - run: cd whatsapp-mcp-server && uv run --package whatsapp-mcp-server python -m unittest

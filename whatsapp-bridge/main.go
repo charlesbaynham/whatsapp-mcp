@@ -1294,6 +1294,8 @@ func main() {
 	if transcriber.Enabled() {
 		logger.Infof("Voice-note transcription enabled (model %s, timeout %s)", transcriber.cfg.ModelPath, transcriber.cfg.Timeout)
 		transcriber.Start()
+	} else {
+		transcriber.ReleasePending()
 	}
 
 	// Setup event handling for messages and history sync

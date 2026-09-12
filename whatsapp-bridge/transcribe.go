@@ -123,6 +123,23 @@ func (t *Transcriber) Start() {
 	})
 }
 
+// ReleasePending publishes every row still marked pending as
+// transcription-disabled. Called at startup when transcription is off, so a
+// note gated by a previous run never stays unpublished.
+func (t *Transcriber) ReleasePending() {
+	pending, err := t.store.pendingTranscriptions()
+	if err != nil {
+		t.logger.Warnf("transcribe: failed to list pending rows: %v", err)
+		return
+	}
+	for _, j := range pending {
+		t.finish(j, "", transcriptionDisabled)
+	}
+	if len(pending) > 0 {
+		t.logger.Infof("transcribe: released %d pending voice note(s) without transcripts (transcription disabled)", len(pending))
+	}
+}
+
 // Enqueue adds a job. A full queue fails the message open (published with
 // status failed) rather than blocking the receive path.
 func (t *Transcriber) Enqueue(job transcribeJob) {
