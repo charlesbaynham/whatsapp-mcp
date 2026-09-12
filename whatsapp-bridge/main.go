@@ -328,10 +328,21 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// VoiceNote sends the media as a playable WhatsApp voice message,
+	// transcoding it to Ogg Opus with ffmpeg first if it isn't one already.
+	VoiceNote bool `json:"voice_note,omitempty"`
+	// uploadName is the original filename of a multipart upload, used as the
+	// document title instead of the temp file's name.
+	uploadName string
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath string, logger waLog.Logger) (bool, string) {
+func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath string, voiceNote bool, logger waLog.Logger) (bool, string) {
+	return sendWhatsAppMedia(ctx, client, messageStore, recipient, message, mediaPath, "", voiceNote, logger)
+}
+
+// sendWhatsAppMedia is sendWhatsAppMessage with an explicit document title.
+func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath, title string, voiceNote bool, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -366,13 +377,23 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageS
 			return false, fmt.Sprintf("Rejected media_path: %v", err)
 		}
 
-		mediaData, err := os.ReadFile(resolvedPath)
+		sendPath := resolvedPath
+		if voiceNote && !isOggOpus(resolvedPath) {
+			converted, err := convertToOpusOgg(ctx, resolvedPath, filepath.Join(messageStore.StoreDir, "tmp"))
+			if err != nil {
+				return false, fmt.Sprintf("Error converting audio to Ogg Opus: %v", err)
+			}
+			defer os.Remove(converted)
+			sendPath = converted
+		}
+
+		mediaData, err := os.ReadFile(sendPath)
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}
 
 		// Determine media type and mime type based on file extension
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
+		fileExt := strings.TrimPrefix(strings.ToLower(filepath.Ext(sendPath)), ".")
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -478,7 +499,7 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageS
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(documentTitle(title, mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -521,6 +542,14 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageS
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// documentTitle prefers an explicit title (an upload's original name) over the on-disk filename.
+func documentTitle(title, mediaPath string) string {
+	if title != "" {
+		return title
+	}
+	return filepath.Base(mediaPath)
 }
 
 // Extract media info from a message
@@ -901,11 +930,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			return
 		}
 
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
+		req, cleanup, err := parseSendRequest(r, messageStore.StoreDir)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		defer cleanup()
 
 		if req.Recipient == "" {
 			http.Error(w, "Recipient is required", http.StatusBadRequest)
@@ -923,7 +953,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			fmt.Println("Received request to send message to", req.Recipient)
 		}
 
-		success, message := sendWhatsAppMessage(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, logger)
+		success, message := sendWhatsAppMedia(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
 		fmt.Println("Message sent", success, message)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -981,6 +1011,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Streams a media message's bytes, downloading it into the store first if
+	// needed, so a client without store access can still fetch attachments.
+	mux.HandleFunc("/api/media/{chat_jid}/{message_id}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !requireReady(client, w) {
+			return
+		}
+		success, _, filename, path, err := downloadMedia(r.Context(), client, messageStore, r.PathValue("message_id"), r.PathValue("chat_jid"))
+		if !success || err != nil {
+			status := http.StatusInternalServerError
+			if err != nil && (strings.Contains(err.Error(), "failed to find message") || strings.Contains(err.Error(), "not a media message")) {
+				status = http.StatusNotFound
+			}
+			writeError(w, status, "failed to fetch media: %v", err)
+			return
+		}
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
+		http.ServeFile(w, r, path)
 	})
 
 	// Handler for requesting more on-demand history for one chat
