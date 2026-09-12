@@ -87,23 +87,26 @@ exists in `readstate_test.go`).
 
 `GET /api/events?since=<cursor>` returning `text/event-stream`.
 
-- Cursor is the SQLite `rowid` of `messages` (monotonic insertion order,
-  which is exactly "what arrived since I last looked", including history
-  sync backfill). Note `INSERT OR REPLACE` in `StoreMessage` reassigns
-  rowid on edits; switch it to an upsert (`ON CONFLICT DO UPDATE`) so a
-  re-stored message keeps its position, and emit `message.updated` instead.
-- On connect the bridge replays rows `> since` from the DB, then streams
-  live. Each SSE frame carries `id: <rowid>` so `Last-Event-ID` reconnect
-  works with a plain SSE library. Client persists its cursor; the bridge
-  keeps no per-client state.
-- Event types: `message.new`, `message.updated`, `chat.read` (from
-  `/api/mark-read`), `bridge.status` (connected / logged_in transitions).
-  Payload for messages is the existing `WebhookEvent` struct plus `rowid`,
-  `media_type`, `filename`, and `has_media`.
+- Backed by a new append-only `events` table (`id INTEGER PRIMARY KEY`,
+  `type`, `chat_jid`, `message_id`, `payload` JSON, `created_at`). A row is
+  appended at the moment a message becomes *publishable* (see Transcription
+  below), not when it is stored. The cursor is the event id: monotonic,
+  survives edits and history-sync backfill, and lets the event log be the
+  single source for both SSE and webhooks.
+- On connect the bridge replays events `> since`, then streams live. Each
+  SSE frame carries `id: <event id>` so `Last-Event-ID` reconnect works
+  with a plain SSE library. Client persists its cursor; the bridge keeps no
+  per-client state.
+- Event types: `message.new`, `message.updated` (edits, and on-demand
+  transcript backfill), `chat.read` (from `/api/mark-read`),
+  `bridge.status` (connected / logged_in transitions). Message payload is
+  the existing `WebhookEvent` struct plus `media_type`, `filename`,
+  `has_media`, `transcript`, and `transcription_status`.
 - Filters as query params: `chat_jid`, `include_from_me`, `types`.
-- Implementation: one fan-out hub in Go fed from the same call site as
-  `dispatcher.Notify` (main.go:617). Replay-then-subscribe must be ordered
-  (subscribe first, then replay, dedupe by rowid) to avoid a gap.
+- Implementation: `publish(event)` appends the row, then fans out to SSE
+  subscribers and to the webhook dispatcher (which replaces the direct
+  `dispatcher.Notify` at main.go:617). Replay-then-subscribe must be
+  ordered (subscribe first, then replay, dedupe by id) to avoid a gap.
 
 Why SSE over long-poll or a Unix socket protocol: resumable with one header,
 works from `curl`, `httpx`, and Go with no extra dependencies, and the
@@ -119,18 +122,44 @@ bridge already speaks HTTP.
   (`libopus`, 32k, 24 kHz, same as `audio.py`) into `store/tmp` and cleans up.
   Optionally accept `multipart/form-data` so a client can upload a file
   rather than write into the store. `audio.py` is then deleted.
-- **Voice-note transcription**, local, no network. When an incoming
-  message is a PTT/audio, the bridge downloads it and runs Whisper on it,
-  storing the result in a new `messages.transcript` column. Runner:
-  `whisper.cpp` (`whisper-cli`, packaged in nixpkgs, CPU-only, ~1 s per
-  10 s of audio with the `base` model) invoked as a subprocess, same
-  pattern as ffmpeg. Model file path and enable flag via env. Transcripts
-  surface everywhere content does: `content` in the read API and events is
-  left as-is, and a separate `transcript` field is added, so consumers can
-  tell speech from typed text. A `message.updated` event fires once the
-  transcript lands (it is async, seconds after `message.new`). Failed or
-  disabled transcription leaves the field null. Backfill is on demand via
-  `POST /api/messages/{chat_jid}/{id}/transcribe`.
+### Transcription of incoming voice notes
+
+Local, no network, whisper.cpp (`whisper-cli` from nixpkgs, CPU-only) run
+as a subprocess, same pattern as ffmpeg. Model defaults to `base` (the host
+is compute-constrained); path and model via env, upgradeable later without
+code changes.
+
+Publication is gated on transcription, so consumers see one event per
+voice note, never a raw-media event followed by a transcript event. That
+matters for webhooks (one Claude routine run, not two) and for the
+Hindsight forwarder (one retain, not two).
+
+- Receive path for a PTT/audio message: store row, download media, enqueue
+  transcription. Text messages are published immediately as now; only the
+  voice note itself waits. Ordering within a chat is therefore by
+  publication time, and a text reply can be published before the voice
+  note it answers. Consumers already handle this since `timestamp` is the
+  WhatsApp send time.
+- One worker goroutine, serialised: at most one whisper process at a time.
+  Bounded queue; a bridge restart re-enqueues rows with
+  `transcription_status = 'pending'` on startup so nothing is lost.
+- Per-message timeout, default 120 s. On failure or timeout the message is
+  published anyway with `transcript = null` and `transcription_status =
+  'failed'` (or `'timeout'`), so a bad audio file cannot block the stream.
+- Payload for a voice note: `media_type = "audio"`, `has_media = true`,
+  `transcript = "<text>"`, `transcription_status = "ok"`. `content` is
+  left as WhatsApp delivered it (usually empty), so consumers can tell
+  speech from typed text, and the raw file is fetchable via
+  `GET /api/media/{chat_jid}/{message_id}`. The webhook text summary
+  renders it as `[voice note, 0:42] <transcript>`.
+- Schema: `messages.transcript TEXT`, `messages.transcription_status TEXT`
+  (`pending`, `ok`, `failed`, `timeout`, `disabled`). Read endpoints return
+  both.
+- Backfill on demand via `POST /api/messages/{chat_jid}/{id}/transcribe`,
+  which emits `message.updated` when done. This is the only case where a
+  transcript arrives as a second event, and it is caller-initiated.
+- Transcription off (`WHATSAPP_TRANSCRIBE=0` or no model file) publishes
+  voice notes immediately with `transcription_status = 'disabled'`.
 
 ### Binding: Unix socket, not TCP
 
@@ -204,9 +233,11 @@ port at all. ffmpeg and whisper.cpp are on the bridge unit's `path` only.
 2. **`whatsapp-client` package + MCP server switch**. Delete SQLite and
    ffmpeg from Python. Existing MCP tool contracts unchanged, so this is
    verifiable against the live server with the same tool calls.
-3. **Events stream** (upsert fix, hub, SSE handler, client generator).
+3. **Events stream** (`events` table, `publish()`, SSE handler, webhook
+   dispatcher fed from it, client generator).
 4. **Voice notes, media streaming, multipart upload in Go**.
-5. **Whisper transcription** (column, subprocess runner, `message.updated`).
+5. **Whisper transcription** (columns, serialised worker, publication gate,
+   restart recovery, backfill endpoint).
 6. **hindsight-forwarder** plus nix unit.
 
 Phases 1 and 2 are the bulk of the work (about 500 lines of SQL to port,
