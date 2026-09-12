@@ -28,6 +28,10 @@ type MessageView struct {
 	IsFromMe   bool      `json:"is_from_me"`
 	MediaType  string    `json:"media_type,omitempty"`
 	Filename   string    `json:"filename,omitempty"`
+	// Transcript is the spoken text of a voice note (content stays as
+	// delivered); TranscriptionStatus is ok, pending, failed, timeout or disabled.
+	Transcript          string `json:"transcript,omitempty"`
+	TranscriptionStatus string `json:"transcription_status,omitempty"`
 }
 
 // ChatView is one chat as the read API returns it.
@@ -82,12 +86,12 @@ func clampPage(limit, page int) (int, int) {
 }
 
 const messageSelectColumns = `m.id, m.chat_jid, COALESCE(c.name, ''), m.sender, COALESCE(m.content, ''), m.timestamp, m.is_from_me,
-	COALESCE(m.media_type, ''), COALESCE(m.filename, '')`
+	COALESCE(m.media_type, ''), COALESCE(m.filename, ''), COALESCE(m.transcript, ''), COALESCE(m.transcription_status, '')`
 
 func scanMessageView(row interface{ Scan(dest ...any) error }) (MessageView, error) {
 	var v MessageView
 	var ts sql.NullTime
-	if err := row.Scan(&v.ID, &v.ChatJID, &v.ChatName, &v.Sender, &v.Content, &ts, &v.IsFromMe, &v.MediaType, &v.Filename); err != nil {
+	if err := row.Scan(&v.ID, &v.ChatJID, &v.ChatName, &v.Sender, &v.Content, &ts, &v.IsFromMe, &v.MediaType, &v.Filename, &v.Transcript, &v.TranscriptionStatus); err != nil {
 		return MessageView{}, err
 	}
 	if ts.Valid {

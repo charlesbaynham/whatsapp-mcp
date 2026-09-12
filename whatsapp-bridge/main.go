@@ -108,6 +108,12 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, err
 	}
+	for col, ddl := range map[string]string{"transcript": "TEXT", "transcription_status": "TEXT NOT NULL DEFAULT ''"} {
+		if err := ensureColumn(db, "messages", col, ddl); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to add messages.%s: %v", col, err)
+		}
+	}
 
 	// Gated on the column being absent: must only run once, or it would wipe real unread state.
 	hasReadTimestampCol := false
@@ -594,7 +600,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, msg *events.Message, logger waLog.Logger, logBodies bool) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, msg *events.Message, logger waLog.Logger, logBodies bool) {
 	// Save message to database. Resolve LID addressing to phone numbers
 	// where whatsmeow's local mapping store lets us, so a contact ends up
 	// under one chat JID regardless of which addressing form WhatsApp used
@@ -646,19 +652,36 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 		return
 	}
 
+	// Voice notes wait for their transcript before publication, so every
+	// consumer sees one event with the text attached rather than two.
 	if pub != nil {
-		pub.PublishMessage(WebhookEvent{
-			MessageID: msg.Info.ID,
-			ChatJID:   chatJID,
-			ChatName:  name,
-			Sender:    sender,
-			Content:   content,
-			Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
-			IsFromMe:  msg.Info.IsFromMe,
-			MediaType: mediaType,
-			Filename:  filename,
-			HasMedia:  mediaType != "",
-		})
+		switch {
+		case mediaType == "audio" && transcriber.Enabled():
+			if err := messageStore.markTranscriptionPending(chatJID, msg.Info.ID); err != nil {
+				logger.Warnf("Failed to mark %s pending transcription: %v", msg.Info.ID, err)
+			}
+			transcriber.Enqueue(transcribeJob{chatJID: chatJID, messageID: msg.Info.ID})
+		default:
+			ev := WebhookEvent{
+				MessageID: msg.Info.ID,
+				ChatJID:   chatJID,
+				ChatName:  name,
+				Sender:    sender,
+				Content:   content,
+				Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
+				IsFromMe:  msg.Info.IsFromMe,
+				MediaType: mediaType,
+				Filename:  filename,
+				HasMedia:  mediaType != "",
+			}
+			if mediaType == "audio" {
+				ev.TranscriptionStatus = transcriptionDisabled
+				if err := messageStore.setTranscription(chatJID, msg.Info.ID, "", transcriptionDisabled); err != nil {
+					logger.Warnf("Failed to record transcription state: %v", err)
+				}
+			}
+			pub.PublishMessage(ev)
+		}
 	}
 
 	// Log message reception. Body content is only logged when explicitly
@@ -905,13 +928,14 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 	dispatcher := pub.dispatcher
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
 	registerReadRoutes(mux, messageStore)
 	registerEventRoutes(mux, messageStore, pub)
+	registerTranscribeRoutes(mux, messageStore, transcriber)
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		jid := ""
@@ -1255,11 +1279,28 @@ func main() {
 	dispatcher := NewWebhookDispatcher(messageStore, logger)
 	pub := NewPublisher(messageStore, dispatcher, logger)
 
+	// Voice notes are transcribed locally before publication (see transcribe.go).
+	transcriber := NewTranscriber(newTranscriberConfigFromEnv(storeDir), messageStore, pub, logger)
+	transcriber.fetch = func(ctx context.Context, chatJID, messageID string) (string, error) {
+		ok, _, _, path, err := downloadMedia(ctx, client, messageStore, messageID, chatJID)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("download failed")
+		}
+		return path, nil
+	}
+	if transcriber.Enabled() {
+		logger.Infof("Voice-note transcription enabled (model %s, timeout %s)", transcriber.cfg.ModelPath, transcriber.cfg.Timeout)
+		transcriber.Start()
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			handleMessage(client, messageStore, pub, v, logger, logBodies)
+			handleMessage(client, messageStore, pub, transcriber, v, logger, logBodies)
 
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger, logBodies)
@@ -1290,7 +1331,7 @@ func main() {
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, pub, bridgeAddr, socketGroup, logBodies, logger)
+	server := startRESTServer(client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {
