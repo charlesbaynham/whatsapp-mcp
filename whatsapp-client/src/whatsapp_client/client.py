@@ -37,11 +37,25 @@ class BridgeUnavailable(BridgeError):
 
 @dataclass
 class Event:
-    """One frame from GET /api/events."""
+    """One frame from GET /api/events.
+
+    ``data`` is the whole event record (id, type, chat_jid, message_id,
+    is_from_me, created_at, data); ``payload`` is its inner ``data`` field,
+    e.g. the message for message.new.
+    """
 
     id: int
     type: str
     data: Dict[str, Any]
+
+    @property
+    def payload(self) -> Dict[str, Any]:
+        inner = self.data.get("data")
+        return inner if isinstance(inner, dict) else {}
+
+    @property
+    def chat_jid(self) -> str:
+        return str(self.data.get("chat_jid") or "")
 
 
 def parse_bridge_url(url: str) -> Tuple[str, Optional[str]]:

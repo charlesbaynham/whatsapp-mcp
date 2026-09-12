@@ -114,6 +114,13 @@ class SSEParserTests(unittest.TestCase):
             (8, "chat.read", {"b": 2}),
         ])
 
+    def test_payload_and_chat_jid_accessors(self):
+        from whatsapp_client import Event
+        ev = Event(id=1, type="message.new", data={"chat_jid": "c@s.whatsapp.net", "data": {"content": "x"}})
+        self.assertEqual(ev.payload, {"content": "x"})
+        self.assertEqual(ev.chat_jid, "c@s.whatsapp.net")
+        self.assertEqual(Event(id=1, type="bridge.status", data={}).payload, {})
+
 
 class EventsStreamTests(unittest.TestCase):
     def test_events_yields_and_resumes_cursor(self):

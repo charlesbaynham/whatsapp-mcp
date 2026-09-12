@@ -104,6 +104,10 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := createEventsTable(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	// Gated on the column being absent: must only run once, or it would wipe real unread state.
 	hasReadTimestampCol := false
@@ -590,7 +594,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, msg *events.Message, logger waLog.Logger, logBodies bool) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, msg *events.Message, logger waLog.Logger, logBodies bool) {
 	// Save message to database. Resolve LID addressing to phone numbers
 	// where whatsmeow's local mapping store lets us, so a contact ends up
 	// under one chat JID regardless of which addressing form WhatsApp used
@@ -642,8 +646,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, dispatc
 		return
 	}
 
-	if dispatcher != nil {
-		dispatcher.Notify(WebhookEvent{
+	if pub != nil {
+		pub.PublishMessage(WebhookEvent{
 			MessageID: msg.Info.ID,
 			ChatJID:   chatJID,
 			ChatName:  name,
@@ -653,6 +657,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, dispatc
 			IsFromMe:  msg.Info.IsFromMe,
 			MediaType: mediaType,
 			Filename:  filename,
+			HasMedia:  mediaType != "",
 		})
 	}
 
@@ -900,11 +905,13 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
+	dispatcher := pub.dispatcher
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
 	registerReadRoutes(mux, messageStore)
+	registerEventRoutes(mux, messageStore, pub)
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		jid := ""
@@ -1155,6 +1162,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			})
 			return
 		}
+		pub.PublishChatRead(req.ChatJID, newest, "api")
 
 		resp := MarkReadResponse{
 			Success:     true,
@@ -1242,35 +1250,47 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// Dispatches incoming messages to any subscribed webhooks.
+	// Every publishable event goes through pub: into the event log, out to
+	// SSE subscribers, and (new messages only) to subscribed webhooks.
 	dispatcher := NewWebhookDispatcher(messageStore, logger)
+	pub := NewPublisher(messageStore, dispatcher, logger)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			handleMessage(client, messageStore, dispatcher, v, logger, logBodies)
+			handleMessage(client, messageStore, pub, v, logger, logBodies)
 
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger, logBodies)
 
 		case *events.Receipt:
-			handleReceipt(client, messageStore, v, logger)
+			handleReceipt(client, messageStore, pub, v, logger)
 
 		case *events.MarkChatAsRead:
-			handleMarkChatAsRead(client, messageStore, v, logger)
+			handleMarkChatAsRead(client, messageStore, pub, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			jid := ""
+			if client.Store.ID != nil {
+				jid = client.Store.ID.String()
+			}
+			pub.PublishBridgeStatus(true, client.Store.ID != nil, jid)
+
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp")
+			pub.PublishBridgeStatus(false, client.Store.ID != nil, "")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			pub.PublishBridgeStatus(client.IsConnected(), false, "")
 		}
 	})
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, dispatcher, bridgeAddr, socketGroup, logBodies, logger)
+	server := startRESTServer(client, messageStore, pub, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {
