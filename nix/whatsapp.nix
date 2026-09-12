@@ -182,16 +182,25 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    users.users.${cfg.user} = {
+    users.users = {
+      ${cfg.user} = {
+        isSystemUser = true;
+        group = cfg.user;
+        home = cfg.stateDir;
+        description = "WhatsApp bridge";
+        # Needed so the bridge can chgrp its socket to the clients group.
+        extraGroups = [ clientsGroup ];
+      };
+    } // lib.mapAttrs' (name: client: lib.nameValuePair client.user {
       isSystemUser = true;
-      group = cfg.user;
-      home = cfg.stateDir;
-      description = "WhatsApp bridge";
-      # Needed so the bridge can chgrp its socket to the clients group.
-      extraGroups = [ clientsGroup ];
-    };
-    users.groups.${cfg.user} = { };
-    users.groups.${clientsGroup} = { };
+      group = client.user;
+      description = client.description;
+    }) cfg.clients;
+
+    users.groups = {
+      ${cfg.user} = { };
+      ${clientsGroup} = { };
+    } // lib.mapAttrs' (name: client: lib.nameValuePair client.user { }) cfg.clients;
 
     systemd.tmpfiles.rules = [
       "d ${cfg.stateDir} 0750 ${cfg.user} ${cfg.user} -"
@@ -199,37 +208,39 @@ in
       "d ${storeDir}/tmp 0750 ${cfg.user} ${cfg.user} -"
     ];
 
-    systemd.services.whatsapp-bridge = {
-      description = "WhatsApp bridge (Go, holds the session)";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
-      # ffmpeg converts outgoing voice notes to opus/ogg and decodes incoming
-      # ones for whisper.
-      path = [ pkgs.ffmpeg ] ++ lib.optional cfg.transcription.enable pkgs.whisper-cpp;
+    systemd.services = lib.mapAttrs' (name: client: lib.nameValuePair "whatsapp-${name}" (mkClientService name client)) cfg.clients // {
+      whatsapp-bridge = {
+        description = "WhatsApp bridge (Go, holds the session)";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+        # ffmpeg converts outgoing voice notes to opus/ogg and decodes incoming
+        # ones for whisper.
+        path = [ pkgs.ffmpeg ] ++ lib.optional cfg.transcription.enable pkgs.whisper-cpp;
 
-      environment = {
-        WHATSAPP_STORE_DIR = storeDir;
-        WHATSAPP_BRIDGE_ADDR = "unix:${socketPath}";
-        WHATSAPP_BRIDGE_SOCKET_GROUP = clientsGroup;
-      } // lib.optionalAttrs cfg.transcription.enable {
-        WHATSAPP_TRANSCRIBE = "1";
-        WHATSAPP_WHISPER_MODEL = "${storeDir}/models/ggml-${cfg.transcription.model}.bin";
-      };
+        environment = {
+          WHATSAPP_STORE_DIR = storeDir;
+          WHATSAPP_BRIDGE_ADDR = "unix:${socketPath}";
+          WHATSAPP_BRIDGE_SOCKET_GROUP = clientsGroup;
+        } // lib.optionalAttrs cfg.transcription.enable {
+          WHATSAPP_TRANSCRIBE = "1";
+          WHATSAPP_WHISPER_MODEL = "${storeDir}/models/ggml-${cfg.transcription.model}.bin";
+        };
 
-      serviceConfig = hardening // {
-        User = cfg.user;
-        Group = cfg.user;
-        SupplementaryGroups = [ clientsGroup ];
-        RuntimeDirectory = "whatsapp";
-        RuntimeDirectoryMode = "0755";
-        ReadWritePaths = [ storeDir ];
-        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
-        WorkingDirectory = storeDir;
-        # buildGoModule names the binary after go.mod's module path.
-        ExecStart = "${cfg.bridge}/bin/whatsapp-client";
-        Restart = "always";
-        RestartSec = 5;
+        serviceConfig = hardening // {
+          User = cfg.user;
+          Group = cfg.user;
+          SupplementaryGroups = [ clientsGroup ];
+          RuntimeDirectory = "whatsapp";
+          RuntimeDirectoryMode = "0755";
+          ReadWritePaths = [ storeDir ];
+          RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+          WorkingDirectory = storeDir;
+          # buildGoModule names the binary after go.mod's module path.
+          ExecStart = "${cfg.bridge}/bin/whatsapp-client";
+          Restart = "always";
+          RestartSec = 5;
+        };
       };
     };
 
@@ -261,15 +272,6 @@ in
       environmentFile = cfg.hindsight.environmentFile;
       execStart = "${cfg.pythonEnv}/bin/python -m hindsight_forwarder.main";
     };
-
-    users.users = lib.mapAttrs' (name: client: lib.nameValuePair client.user {
-      isSystemUser = true;
-      group = client.user;
-      description = client.description;
-    }) cfg.clients;
-    users.groups = lib.mapAttrs' (name: client: lib.nameValuePair client.user { }) cfg.clients;
-
-    systemd.services = lib.mapAttrs' (name: client: lib.nameValuePair "whatsapp-${name}" (mkClientService name client)) cfg.clients;
 
     # allowedSources must include the hypervisor: it health-checks this port after every deploy, and blocking it triggers a rollback.
     networking.firewall.extraCommands = lib.concatMapStringsSep "\n"
