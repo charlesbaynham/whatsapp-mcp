@@ -19,7 +19,7 @@ Here's an example of what you can do when it's connected to Claude.
 ### Prerequisites
 
 - Go
-- Python 3.6+
+- Python 3.11+
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
@@ -39,7 +39,7 @@ Here's an example of what you can do when it's connected to Claude.
 
    ```bash
    cd whatsapp-bridge
-   go run main.go
+   go run .
    ```
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
@@ -57,9 +57,10 @@ Here's an example of what you can do when it's connected to Claude.
          "command": "{{PATH_TO_UV}}", // Run `which uv` and place the output here
          "args": [
            "--directory",
-           "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server"
+           "{{PATH_TO_SRC}}/whatsapp-mcp", // cd into the repo, run `pwd` and enter the output here
            "run",
-           "main.py"
+           "--package", "whatsapp-mcp-server",
+           "whatsapp-mcp-server/main.py"
          ]
        }
      }
@@ -86,32 +87,41 @@ Here's an example of what you can do when it's connected to Claude.
 
 ## Running as a hosted service
 
-Both components can also run unattended on a server instead of a laptop —
-the Go bridge binds to loopback and stores its state in a configurable
-directory, and the Python server can serve MCP over HTTP instead of stdio.
+Both components can also run unattended on a server instead of a laptop.
+The Go bridge listens on a Unix socket and stores its state in a
+configurable directory; the Python MCP server (and any other client) talks
+to that socket and can serve MCP over HTTP instead of stdio. `nix/whatsapp.nix`
+is the reference deployment: one hardened systemd unit per client, each its
+own user, admitted to the socket by group membership and nothing else.
 
 ### `whatsapp-bridge` environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `WHATSAPP_STORE_DIR` | `store` | Directory for `whatsapp.db`, `messages.db` and downloaded media |
-| `WHATSAPP_BRIDGE_ADDR` | `127.0.0.1:8080` | Listen address for the REST API |
+| `WHATSAPP_BRIDGE_ADDR` | `127.0.0.1:8080` | Listen address: a TCP `host:port`, or `unix:/path/to.sock` (mode 0660) |
+| `WHATSAPP_BRIDGE_SOCKET_GROUP` | unset | With a Unix socket, chgrp it to this group so clients are admitted by membership |
 | `WHATSAPP_LOG_MESSAGE_BODIES` | unset | Set to `1` to log message content to stdout; by default only metadata (timestamp, direction, chat, media type) is logged |
+| `WHATSAPP_TRANSCRIBE` | unset | Set to `1` to transcribe incoming voice notes locally with whisper.cpp |
+| `WHATSAPP_WHISPER_MODEL` | `<store>/models/ggml-base.bin` | whisper.cpp model file; downloaded on first use if missing |
+| `WHATSAPP_WHISPER_BIN` | `whisper-cli` | whisper.cpp binary name or path |
 
-`GET /api/status` returns `{"connected": bool, "logged_in": bool, "jid": "..."}` (always HTTP 200) and can be polled before pairing. The REST server starts before the QR/pairing step, so `/api/status` is answerable immediately; `/api/send` and `/api/download` return `503` with a JSON `{"error": "..."}` body until the bridge is connected and logged in. On first run, scan the printed QR code from the process's stdout (e.g. via `journalctl` if run under systemd) — there is no timeout, so a headless deployment can just wait for it to be scanned.
+The REST API is documented in [`docs/bridge-api.md`](docs/bridge-api.md). It
+starts before the QR/pairing step, so `GET /api/status` is answerable
+immediately; endpoints that need WhatsApp return `503` until the bridge is
+connected and logged in. On first run, scan the printed QR code from the
+process's stdout (e.g. via `journalctl` if run under systemd).
 
 ### `whatsapp-mcp-server` environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `WHATSAPP_MESSAGES_DB` | `../whatsapp-bridge/store/messages.db` (relative to the server source) | Path to the bridge's `messages.db` |
-| `WHATSAPP_STORE_DIR` | Directory of `WHATSAPP_MESSAGES_DB` | The bridge's store directory; `media_path` values for `send_file`/`send_audio_message` must resolve inside it |
-| `WHATSAPP_BRIDGE_URL` | `http://localhost:8080/api` | Base URL of the bridge's REST API |
+| `WHATSAPP_BRIDGE_URL` | `http://127.0.0.1:8080` | `unix:/path/to.sock` or `http://host:port` of the bridge |
 | `MCP_TRANSPORT` | `stdio` | `stdio` (upstream default) or `streamable-http` |
 | `MCP_HOST` | `127.0.0.1` | Bind host when `MCP_TRANSPORT=streamable-http` |
 | `MCP_PORT` | `8000` | Bind port when `MCP_TRANSPORT=streamable-http` |
 
-When running with `MCP_TRANSPORT=streamable-http`, the MCP endpoint is served at `/mcp` and a liveness probe is served at `GET /health`, returning `200 {"status": "ok", "paired": bool, "connected": bool}` whenever the bridge's `/api/status` answered at all, and `503 {"status": "error", "reason": "bridge unreachable: ..."}` only when it doesn't — pairing is an operational state, not a deploy outcome, so an unpaired or logged-out bridge is still a healthy process. Suitable as a container health check.
+When running with `MCP_TRANSPORT=streamable-http`, the MCP endpoint is served at `/mcp` and a liveness probe is served at `GET /health`, returning `200 {"status": "ok", "paired": bool, "connected": bool}` whenever the bridge's `/api/status` answered at all, and `503 {"status": "error", "reason": "bridge unreachable: ..."}` only when it doesn't.
 
 ### Windows Compatibility
 
@@ -128,7 +138,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    ```bash
    cd whatsapp-bridge
    go env -w CGO_ENABLED=1
-   go run main.go
+   go run .
    ```
 
 Without this setup, you'll likely run into errors like:
@@ -137,17 +147,22 @@ Without this setup, you'll likely run into errors like:
 
 ## Architecture Overview
 
-This application consists of two main components:
+This is a monorepo: one WhatsApp service and the clients that share it.
 
-1. **Go WhatsApp Bridge** (`whatsapp-bridge/`): A Go application that connects to WhatsApp's web API, handles authentication via QR code, and stores message history in SQLite. It serves as the bridge between WhatsApp and the MCP server.
+1. **Go WhatsApp bridge** (`whatsapp-bridge/`): connects to WhatsApp's web API, handles pairing via QR code, mirrors message history into SQLite, transcribes voice notes, and exposes everything over a REST API (Unix socket or loopback TCP) with a durable server-sent event stream for push. It is the only process that touches the database or media files.
 
-2. **Python MCP Server** (`whatsapp-mcp-server/`): A Python server implementing the Model Context Protocol (MCP), which provides standardized tools for Claude to interact with WhatsApp data and send/receive messages.
+2. **`whatsapp-client`** (`whatsapp-client/`): the Python client library every Python client uses.
+
+3. **Python MCP server** (`whatsapp-mcp-server/`): MCP tools for Claude, a thin client of the bridge.
+
+4. **Hindsight forwarder** (`hindsight-forwarder/`): consumes the event stream and retains messages into Hindsight memory. No LLM involved.
+
+The design notes are in [`docs/rest-interface-plan.md`](docs/rest-interface-plan.md).
 
 ### Data Storage
 
-- All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
-- The database maintains tables for chats and messages
-- Messages are indexed for efficient searching and retrieval
+- All message history is stored in a SQLite database within the bridge's store directory (`whatsapp-bridge/store/` by default)
+- The database maintains tables for chats, messages, webhook subscriptions and the event log
 
 ## Usage
 

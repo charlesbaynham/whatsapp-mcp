@@ -46,7 +46,7 @@ func senderJIDForMarkRead(chat types.JID, senderUser string) types.JID {
 }
 
 // Only reacts to our own devices reading a chat, never to receipts about our outgoing messages.
-func handleReceipt(client *whatsmeow.Client, messageStore *MessageStore, v *events.Receipt, logger waLog.Logger) {
+func handleReceipt(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, v *events.Receipt, logger waLog.Logger) {
 	if !v.IsFromMe || (v.Type != types.ReceiptTypeRead && v.Type != types.ReceiptTypeReadSelf) {
 		return
 	}
@@ -59,10 +59,13 @@ func handleReceipt(client *whatsmeow.Client, messageStore *MessageStore, v *even
 		return
 	}
 	logger.Debugf("Marked chat %s read up to %s (own-device receipt, type=%s)", chatJID, v.Timestamp, v.Type)
+	if pub != nil {
+		pub.PublishChatRead(chatJID, v.Timestamp, "receipt")
+	}
 }
 
 // Reacts to a whole chat being marked read or unread from another device (app-state sync).
-func handleMarkChatAsRead(client *whatsmeow.Client, messageStore *MessageStore, v *events.MarkChatAsRead, logger waLog.Logger) {
+func handleMarkChatAsRead(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, v *events.MarkChatAsRead, logger waLog.Logger) {
 	ctx := context.Background()
 	// No per-stanza alt address here, so only the local LID<->PN cache can resolve it.
 	chat := resolveAlt(ctx, client.Store, v.JID, types.JID{})
@@ -78,6 +81,9 @@ func handleMarkChatAsRead(client *whatsmeow.Client, messageStore *MessageStore, 
 			return
 		}
 		logger.Infof("Chat %s marked read (up to %s) from another device", chatJID, upTo)
+		if pub != nil {
+			pub.PublishChatRead(chatJID, upTo, "app_state")
+		}
 		return
 	}
 

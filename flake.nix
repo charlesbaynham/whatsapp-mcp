@@ -1,5 +1,5 @@
 {
-  description = "WhatsApp MCP server, packaged as a cattle container. Two templates share this one app - `whatsapp` and `charlesbot-whatsapp` build the identical image, deployed as two separate containers each holding its own WhatsApp session and phone-number pairing.";
+  description = "WhatsApp bridge, MCP server and Hindsight forwarder, packaged as a cattle container. Two templates share this one app - `whatsapp` and `charlesbot-whatsapp` build the identical image, deployed as two separate containers each holding its own WhatsApp session and phone-number pairing.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   inputs.cattle.url = "git+https://github.com/charlesbaynham/nix-proxmox-cattle?ref=v1";
@@ -20,7 +20,8 @@
       };
 
       # nixos-26.05 already carries mcp 1.26.0 (>=1.10,<2), so no overlay.
-      mcpEnv = pkgs.python3.withPackages (ps: [ ps.mcp ps.requests ps.httpx ]);
+      # whatsapp-client itself is put on PYTHONPATH from source by the module.
+      pythonEnv = pkgs.python3.withPackages (ps: [ ps.mcp ps.httpx ]);
 
       # The module carries no per-account state (nix/whatsapp.nix), so a second
       # WhatsApp account is just a second template under a different name -
@@ -34,8 +35,10 @@
           {
             services.whatsapp = {
               enable = true;
-              inherit bridge mcpEnv;
+              inherit bridge pythonEnv;
+              clientSource = ./whatsapp-client;
               mcpSource = ./whatsapp-mcp-server;
+              forwarderSource = ./hindsight-forwarder;
             };
           }
         ];

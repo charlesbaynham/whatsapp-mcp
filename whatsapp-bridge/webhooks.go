@@ -105,7 +105,9 @@ func maskWebhookSubscription(sub WebhookSubscription) WebhookSubscriptionView {
 	}
 }
 
-// WebhookEvent describes one WhatsApp message for delivery to a subscriber.
+// WebhookEvent describes one WhatsApp message as published to consumers:
+// the payload of message.new / message.updated events and the body items
+// of webhook deliveries.
 type WebhookEvent struct {
 	MessageID string `json:"message_id"`
 	ChatJID   string `json:"chat_jid"`
@@ -116,6 +118,13 @@ type WebhookEvent struct {
 	IsFromMe  bool   `json:"is_from_me"`
 	MediaType string `json:"media_type,omitempty"`
 	Filename  string `json:"filename,omitempty"`
+	// HasMedia means the attachment is fetchable at /api/media/{chat_jid}/{message_id}.
+	HasMedia bool `json:"has_media"`
+	// Transcript is the spoken text of a voice note; content is left as
+	// WhatsApp delivered it so consumers can tell speech from typing.
+	Transcript          string `json:"transcript,omitempty"`
+	TranscriptionStatus string `json:"transcription_status,omitempty"` // ok, failed, timeout, disabled
+	DurationSeconds     int    `json:"duration_seconds,omitempty"`
 }
 
 // createWebhookSubscriptionsTable is called from NewMessageStore alongside the other tables.
@@ -704,6 +713,14 @@ func buildWebhookText(events []WebhookEvent) string {
 		}
 		var content string
 		switch {
+		case e.Transcript != "":
+			dur := ""
+			if e.DurationSeconds > 0 {
+				dur = fmt.Sprintf(", %d:%02d", e.DurationSeconds/60, e.DurationSeconds%60)
+			}
+			content = fmt.Sprintf("[voice note%s] %s", dur, e.Transcript)
+		case e.MediaType == "audio" && e.TranscriptionStatus != "":
+			content = fmt.Sprintf("[voice note: %s, transcription %s]", e.Filename, e.TranscriptionStatus)
 		case e.MediaType != "" && e.Content != "":
 			content = fmt.Sprintf("[%s: %s] %s", e.MediaType, e.Filename, e.Content)
 		case e.MediaType != "":

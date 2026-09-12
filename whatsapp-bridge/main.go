@@ -104,6 +104,16 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := createEventsTable(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	for col, ddl := range map[string]string{"transcript": "TEXT", "transcription_status": "TEXT NOT NULL DEFAULT ''"} {
+		if err := ensureColumn(db, "messages", col, ddl); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to add messages.%s: %v", col, err)
+		}
+	}
 
 	// Gated on the column being absent: must only run once, or it would wipe real unread state.
 	hasReadTimestampCol := false
@@ -328,10 +338,21 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// VoiceNote sends the media as a playable WhatsApp voice message,
+	// transcoding it to Ogg Opus with ffmpeg first if it isn't one already.
+	VoiceNote bool `json:"voice_note,omitempty"`
+	// uploadName is the original filename of a multipart upload, used as the
+	// document title instead of the temp file's name.
+	uploadName string
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath string, logger waLog.Logger) (bool, string) {
+func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath string, voiceNote bool, logger waLog.Logger) (bool, string) {
+	return sendWhatsAppMedia(ctx, client, messageStore, recipient, message, mediaPath, "", voiceNote, logger)
+}
+
+// sendWhatsAppMedia is sendWhatsAppMessage with an explicit document title.
+func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath, title string, voiceNote bool, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -366,13 +387,23 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageS
 			return false, fmt.Sprintf("Rejected media_path: %v", err)
 		}
 
-		mediaData, err := os.ReadFile(resolvedPath)
+		sendPath := resolvedPath
+		if voiceNote && !isOggOpus(resolvedPath) {
+			converted, err := convertToOpusOgg(ctx, resolvedPath, filepath.Join(messageStore.StoreDir, "tmp"))
+			if err != nil {
+				return false, fmt.Sprintf("Error converting audio to Ogg Opus: %v", err)
+			}
+			defer os.Remove(converted)
+			sendPath = converted
+		}
+
+		mediaData, err := os.ReadFile(sendPath)
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}
 
 		// Determine media type and mime type based on file extension
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
+		fileExt := strings.TrimPrefix(strings.ToLower(filepath.Ext(sendPath)), ".")
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -478,7 +509,7 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageS
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(documentTitle(title, mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -523,6 +554,14 @@ func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageS
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+// documentTitle prefers an explicit title (an upload's original name) over the on-disk filename.
+func documentTitle(title, mediaPath string) string {
+	if title != "" {
+		return title
+	}
+	return filepath.Base(mediaPath)
+}
+
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
@@ -561,7 +600,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, msg *events.Message, logger waLog.Logger, logBodies bool) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, msg *events.Message, logger waLog.Logger, logBodies bool) {
 	// Save message to database. Resolve LID addressing to phone numbers
 	// where whatsmeow's local mapping store lets us, so a contact ends up
 	// under one chat JID regardless of which addressing form WhatsApp used
@@ -613,18 +652,36 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, dispatc
 		return
 	}
 
-	if dispatcher != nil {
-		dispatcher.Notify(WebhookEvent{
-			MessageID: msg.Info.ID,
-			ChatJID:   chatJID,
-			ChatName:  name,
-			Sender:    sender,
-			Content:   content,
-			Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
-			IsFromMe:  msg.Info.IsFromMe,
-			MediaType: mediaType,
-			Filename:  filename,
-		})
+	// Voice notes wait for their transcript before publication, so every
+	// consumer sees one event with the text attached rather than two.
+	if pub != nil {
+		switch {
+		case mediaType == "audio" && transcriber.Enabled():
+			if err := messageStore.markTranscriptionPending(chatJID, msg.Info.ID); err != nil {
+				logger.Warnf("Failed to mark %s pending transcription: %v", msg.Info.ID, err)
+			}
+			transcriber.Enqueue(transcribeJob{chatJID: chatJID, messageID: msg.Info.ID})
+		default:
+			ev := WebhookEvent{
+				MessageID: msg.Info.ID,
+				ChatJID:   chatJID,
+				ChatName:  name,
+				Sender:    sender,
+				Content:   content,
+				Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
+				IsFromMe:  msg.Info.IsFromMe,
+				MediaType: mediaType,
+				Filename:  filename,
+				HasMedia:  mediaType != "",
+			}
+			if mediaType == "audio" {
+				ev.TranscriptionStatus = transcriptionDisabled
+				if err := messageStore.setTranscription(chatJID, msg.Info.ID, "", transcriptionDisabled); err != nil {
+					logger.Warnf("Failed to record transcription state: %v", err)
+				}
+			}
+			pub.PublishMessage(ev)
+		}
 	}
 
 	// Log message reception. Body content is only logged when explicitly
@@ -871,10 +928,14 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispatcher *WebhookDispatcher, addr string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
+	dispatcher := pub.dispatcher
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
+	registerReadRoutes(mux, messageStore)
+	registerEventRoutes(mux, messageStore, pub)
+	registerTranscribeRoutes(mux, messageStore, transcriber)
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		jid := ""
@@ -900,11 +961,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			return
 		}
 
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
+		req, cleanup, err := parseSendRequest(r, messageStore.StoreDir)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		defer cleanup()
 
 		if req.Recipient == "" {
 			http.Error(w, "Recipient is required", http.StatusBadRequest)
@@ -922,7 +984,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			fmt.Println("Received request to send message to", req.Recipient)
 		}
 
-		success, message := sendWhatsAppMessage(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, logger)
+		success, message := sendWhatsAppMedia(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
 		fmt.Println("Message sent", success, message)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -980,6 +1042,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Streams a media message's bytes, downloading it into the store first if
+	// needed, so a client without store access can still fetch attachments.
+	mux.HandleFunc("/api/media/{chat_jid}/{message_id}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !requireReady(client, w) {
+			return
+		}
+		success, _, filename, path, err := downloadMedia(r.Context(), client, messageStore, r.PathValue("message_id"), r.PathValue("chat_jid"))
+		if !success || err != nil {
+			status := http.StatusInternalServerError
+			if err != nil && (strings.Contains(err.Error(), "failed to find message") || strings.Contains(err.Error(), "not a media message")) {
+				status = http.StatusNotFound
+			}
+			writeError(w, status, "failed to fetch media: %v", err)
+			return
+		}
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
+		http.ServeFile(w, r, path)
 	})
 
 	// Handler for requesting more on-demand history for one chat
@@ -1101,6 +1186,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 			})
 			return
 		}
+		pub.PublishChatRead(req.ChatJID, newest, "api")
 
 		resp := MarkReadResponse{
 			Success:     true,
@@ -1116,11 +1202,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, dispa
 		json.NewEncoder(w).Encode(resp)
 	})
 
-	server := &http.Server{Addr: addr, Handler: mux}
+	server := &http.Server{Handler: mux}
+	ln, err := listenAddr(addr, socketGroup)
+	if err != nil {
+		logger.Errorf("Failed to listen on %s: %v", addr, err)
+		os.Exit(1)
+	}
 	fmt.Printf("Starting REST API server on %s...\n", addr)
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -1133,6 +1224,7 @@ func main() {
 
 	storeDir := getEnvOrDefault("WHATSAPP_STORE_DIR", "store")
 	bridgeAddr := getEnvOrDefault("WHATSAPP_BRIDGE_ADDR", "127.0.0.1:8080")
+	socketGroup := os.Getenv("WHATSAPP_BRIDGE_SOCKET_GROUP")
 	logBodies := os.Getenv("WHATSAPP_LOG_MESSAGE_BODIES") == "1"
 
 	// Set up logger
@@ -1182,35 +1274,66 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// Dispatches incoming messages to any subscribed webhooks.
+	// Every publishable event goes through pub: into the event log, out to
+	// SSE subscribers, and (new messages only) to subscribed webhooks.
 	dispatcher := NewWebhookDispatcher(messageStore, logger)
+	pub := NewPublisher(messageStore, dispatcher, logger)
+
+	// Voice notes are transcribed locally before publication (see transcribe.go).
+	transcriber := NewTranscriber(newTranscriberConfigFromEnv(storeDir), messageStore, pub, logger)
+	transcriber.fetch = func(ctx context.Context, chatJID, messageID string) (string, error) {
+		ok, _, _, path, err := downloadMedia(ctx, client, messageStore, messageID, chatJID)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("download failed")
+		}
+		return path, nil
+	}
+	if transcriber.Enabled() {
+		logger.Infof("Voice-note transcription enabled (model %s, timeout %s)", transcriber.cfg.ModelPath, transcriber.cfg.Timeout)
+		transcriber.Start()
+	} else {
+		transcriber.ReleasePending()
+	}
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			handleMessage(client, messageStore, dispatcher, v, logger, logBodies)
+			handleMessage(client, messageStore, pub, transcriber, v, logger, logBodies)
 
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger, logBodies)
 
 		case *events.Receipt:
-			handleReceipt(client, messageStore, v, logger)
+			handleReceipt(client, messageStore, pub, v, logger)
 
 		case *events.MarkChatAsRead:
-			handleMarkChatAsRead(client, messageStore, v, logger)
+			handleMarkChatAsRead(client, messageStore, pub, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			jid := ""
+			if client.Store.ID != nil {
+				jid = client.Store.ID.String()
+			}
+			pub.PublishBridgeStatus(true, client.Store.ID != nil, jid)
+
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp")
+			pub.PublishBridgeStatus(false, client.Store.ID != nil, "")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			pub.PublishBridgeStatus(client.IsConnected(), false, "")
 		}
 	})
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, dispatcher, bridgeAddr, logBodies, logger)
+	server := startRESTServer(client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {

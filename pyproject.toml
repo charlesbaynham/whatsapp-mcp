@@ -1,0 +1,16 @@
+# uv workspace root: the Python members of this monorepo. The Go bridge lives
+# in whatsapp-bridge/ and is built separately (go build / buildGoModule).
+[project]
+name = "whatsapp-monorepo"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["whatsapp-client", "whatsapp-mcp-server", "hindsight-forwarder"]
+
+[tool.uv.sources]
+whatsapp-client = { workspace = true }
