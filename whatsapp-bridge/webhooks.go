@@ -113,11 +113,13 @@ type WebhookEvent struct {
 	ChatJID   string `json:"chat_jid"`
 	ChatName  string `json:"chat_name"`
 	Sender    string `json:"sender"`
-	Content   string `json:"content"`
-	Timestamp string `json:"timestamp"` // RFC3339
-	IsFromMe  bool   `json:"is_from_me"`
-	MediaType string `json:"media_type,omitempty"`
-	Filename  string `json:"filename,omitempty"`
+	// SenderName is the contact name, or "Me", resolved as the read API resolves it.
+	SenderName string `json:"sender_name"`
+	Content    string `json:"content"`
+	Timestamp  string `json:"timestamp"` // RFC3339
+	IsFromMe   bool   `json:"is_from_me"`
+	MediaType  string `json:"media_type,omitempty"`
+	Filename   string `json:"filename,omitempty"`
 	// HasMedia means the attachment is fetchable at /api/media/{chat_jid}/{message_id}.
 	HasMedia bool `json:"has_media"`
 	// Transcript is the spoken text of a voice note; content is left as
@@ -905,13 +907,14 @@ func registerWebhookRoutes(mux *http.ServeMux, messageStore *MessageStore, dispa
 		}
 
 		event := WebhookEvent{
-			MessageID: "test",
-			ChatJID:   sub.ChatJID,
-			ChatName:  sub.ChatJID,
-			Sender:    "whatsapp-bridge",
-			Content:   "Test event from whatsapp-bridge",
-			Timestamp: time.Now().Format(time.RFC3339),
-			IsFromMe:  false,
+			MessageID:  "test",
+			ChatJID:    sub.ChatJID,
+			ChatName:   sub.ChatJID,
+			Sender:     "whatsapp-bridge",
+			SenderName: "whatsapp-bridge",
+			Content:    "Test event from whatsapp-bridge",
+			Timestamp:  time.Now().Format(time.RFC3339),
+			IsFromMe:   false,
 		}
 		// A manual test is a single synchronous attempt: no rate cap, no cooldown/queueing.
 		status, sendErr := dispatcher.deliverOnce(sub, []WebhookEvent{event})

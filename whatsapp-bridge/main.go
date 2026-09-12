@@ -663,16 +663,17 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 			transcriber.Enqueue(transcribeJob{chatJID: chatJID, messageID: msg.Info.ID})
 		default:
 			ev := WebhookEvent{
-				MessageID: msg.Info.ID,
-				ChatJID:   chatJID,
-				ChatName:  name,
-				Sender:    sender,
-				Content:   content,
-				Timestamp: msg.Info.Timestamp.Format(time.RFC3339),
-				IsFromMe:  msg.Info.IsFromMe,
-				MediaType: mediaType,
-				Filename:  filename,
-				HasMedia:  mediaType != "",
+				MessageID:  msg.Info.ID,
+				ChatJID:    chatJID,
+				ChatName:   name,
+				Sender:     sender,
+				SenderName: messageStore.newSenderNamer().name(sender, msg.Info.IsFromMe),
+				Content:    content,
+				Timestamp:  msg.Info.Timestamp.Format(time.RFC3339),
+				IsFromMe:   msg.Info.IsFromMe,
+				MediaType:  mediaType,
+				Filename:   filename,
+				HasMedia:   mediaType != "",
 			}
 			if mediaType == "audio" {
 				ev.TranscriptionStatus = transcriptionDisabled

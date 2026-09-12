@@ -9,6 +9,7 @@
 let
   cfg = config.services.whatsapp;
   storeDir = "${cfg.stateDir}/store";
+  clientStateDir = name: "${cfg.stateDir}/clients/${name}";
   socketPath = "/run/whatsapp/bridge.sock";
   clientsGroup = "whatsapp-clients";
 
@@ -48,7 +49,9 @@ let
     wants = [ "network-online.target" ];
     requires = [ "whatsapp-bridge.service" ];
     path = client.path;
-    environment = { WHATSAPP_BRIDGE_URL = "unix:${socketPath}"; } // client.environment;
+    environment = { WHATSAPP_BRIDGE_URL = "unix:${socketPath}"; }
+      // lib.optionalAttrs client.needsState { STATE_DIRECTORY = clientStateDir name; }
+      // client.environment;
     serviceConfig = hardening // {
       User = client.user;
       Group = client.user;
@@ -59,7 +62,7 @@ let
       Restart = "always";
       RestartSec = 5;
     } // lib.optionalAttrs client.needsState {
-      StateDirectory = "whatsapp-${name}";
+      ReadWritePaths = [ (clientStateDir name) ];
     } // lib.optionalAttrs (client.environmentFile != null) {
       EnvironmentFile = "-${client.environmentFile}";
     };
@@ -84,7 +87,11 @@ let
       needsState = lib.mkOption {
         type = lib.types.bool;
         default = false;
-        description = "Give the client a private StateDirectory at /var/lib/whatsapp-<name> (exposed as $STATE_DIRECTORY).";
+        description = ''
+          Give the client a private directory on the STATE VOLUME (exposed as
+          $STATE_DIRECTORY). Not systemd's StateDirectory: /var/lib is on the
+          cattle rootfs, so a cursor kept there is lost at every deploy.
+        '';
       };
       environmentFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
@@ -127,11 +134,12 @@ in
       enable = lib.mkEnableOption "the Hindsight forwarder client" // { default = true; };
       environmentFile = lib.mkOption {
         type = lib.types.path;
-        default = "${cfg.stateDir}/hindsight.env";
+        default = "${cfg.stateDir}/secrets/hindsight.env";
         description = ''
           File holding HINDSIGHT_URL, HINDSIGHT_API_KEY, HINDSIGHT_BANK and any
-          FORWARDER_* settings (see hindsight-forwarder/). Lives on the state
-          volume, not in the image; the forwarder idles until it exists.
+          FORWARDER_* settings (see hindsight-forwarder/). Seeded by
+          homelab-infra's seed-secret.sh, which writes to <state>/secrets/;
+          the forwarder idles until it exists.
         '';
       };
     };
@@ -208,7 +216,9 @@ in
       "d ${cfg.stateDir} 0750 ${cfg.user} ${cfg.user} -"
       "d ${storeDir}     0750 ${cfg.user} ${cfg.user} -"
       "d ${storeDir}/tmp 0750 ${cfg.user} ${cfg.user} -"
-    ];
+      "d ${cfg.stateDir}/clients 0750 ${cfg.user} ${cfg.user} -"
+    ] ++ lib.mapAttrsToList (name: client: "d ${clientStateDir name} 0700 ${client.user} ${client.user} -")
+      (lib.filterAttrs (name: client: client.needsState) cfg.clients);
 
     systemd.services = lib.mapAttrs' (name: client: lib.nameValuePair "whatsapp-${name}" (mkClientService name client)) cfg.clients // {
       whatsapp-bridge = {

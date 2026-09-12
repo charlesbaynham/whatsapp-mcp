@@ -384,6 +384,7 @@ func (store *MessageStore) messageEvent(chatJID, messageID string) (WebhookEvent
 	}
 	ev.MessageID = messageID
 	ev.ChatJID = chatJID
+	ev.SenderName = store.newSenderNamer().name(ev.Sender, ev.IsFromMe)
 	ev.ChatName = chatName.String
 	ev.Content = content.String
 	if ts.Valid {
