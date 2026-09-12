@@ -58,6 +58,8 @@ let
       RestartSec = 5;
     } // lib.optionalAttrs client.needsState {
       StateDirectory = "whatsapp-${name}";
+    } // lib.optionalAttrs (client.environmentFile != null) {
+      EnvironmentFile = "-${client.environmentFile}";
     };
   };
 
@@ -81,6 +83,11 @@ let
         type = lib.types.bool;
         default = false;
         description = "Give the client a private StateDirectory at /var/lib/whatsapp-<name> (exposed as $STATE_DIRECTORY).";
+      };
+      environmentFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "Optional EnvironmentFile (read by systemd as root, so it can hold secrets the client user cannot read directly). A missing file is tolerated.";
       };
     };
   };
@@ -107,6 +114,24 @@ in
     mcpSource = lib.mkOption {
       type = lib.types.path;
       description = "whatsapp-mcp-server/, run directly rather than installed as a package.";
+    };
+
+    forwarderSource = lib.mkOption {
+      type = lib.types.path;
+      description = "hindsight-forwarder/, run from source like the MCP server.";
+    };
+
+    hindsight = {
+      enable = lib.mkEnableOption "the Hindsight forwarder client" // { default = true; };
+      environmentFile = lib.mkOption {
+        type = lib.types.path;
+        default = "${cfg.stateDir}/hindsight.env";
+        description = ''
+          File holding HINDSIGHT_URL, HINDSIGHT_API_KEY, HINDSIGHT_BANK and any
+          FORWARDER_* settings (see hindsight-forwarder/). Lives on the state
+          volume, not in the image; the forwarder idles until it exists.
+        '';
+      };
     };
 
     stateDir = lib.mkOption {
@@ -222,6 +247,19 @@ in
       };
       addressFamilies = [ "AF_INET" "AF_INET6" ];
       execStart = "${cfg.pythonEnv}/bin/python ${cfg.mcpSource}/main.py";
+    };
+
+    services.whatsapp.clients.hindsight = lib.mkIf cfg.hindsight.enable {
+      description = "WhatsApp to Hindsight forwarder";
+      environment = {
+        PYTHONPATH = "${cfg.clientSource}/src:${cfg.forwarderSource}/src";
+        PYTHONDONTWRITEBYTECODE = "1";
+      };
+      # Reaches Hindsight over the network; the bridge over the socket.
+      addressFamilies = [ "AF_INET" "AF_INET6" ];
+      needsState = true;
+      environmentFile = cfg.hindsight.environmentFile;
+      execStart = "${cfg.pythonEnv}/bin/python -m hindsight_forwarder.main";
     };
 
     users.users = lib.mapAttrs' (name: client: lib.nameValuePair client.user {

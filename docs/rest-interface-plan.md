@@ -1,5 +1,8 @@
 # Splitting the WhatsApp interface from the MCP server
 
+> Status: implemented. This is the design note; the API reference is
+> [`bridge-api.md`](bridge-api.md).
+
 Goal: one local WhatsApp service that any number of non-LLM clients (a
 Hindsight forwarder first) and the MCP server can share, with push delivery,
 without duplicating logic.

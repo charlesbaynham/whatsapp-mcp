@@ -1,5 +1,5 @@
 {
-  description = "WhatsApp MCP server, packaged as a cattle container. Two templates share this one app - `whatsapp` and `charlesbot-whatsapp` build the identical image, deployed as two separate containers each holding its own WhatsApp session and phone-number pairing.";
+  description = "WhatsApp bridge, MCP server and Hindsight forwarder, packaged as a cattle container. Two templates share this one app - `whatsapp` and `charlesbot-whatsapp` build the identical image, deployed as two separate containers each holding its own WhatsApp session and phone-number pairing.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   inputs.cattle.url = "git+https://github.com/charlesbaynham/nix-proxmox-cattle?ref=v1";
@@ -38,6 +38,7 @@
               inherit bridge pythonEnv;
               clientSource = ./whatsapp-client;
               mcpSource = ./whatsapp-mcp-server;
+              forwarderSource = ./hindsight-forwarder;
             };
           }
         ];
