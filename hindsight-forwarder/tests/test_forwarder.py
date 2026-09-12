@@ -5,8 +5,8 @@ from pathlib import Path
 
 import httpx
 
-from hindsight_forwarder.main import (Config, Hindsight, Session, State, describe, retain_item,
-                                      retain_with_retry, run, session_for, transcript_line, wants)
+from hindsight_forwarder.main import (Config, Hindsight, State, describe, document_for, retain_item,
+                                      retain_with_retry, run, transcript_line, wants)
 from whatsapp_client import Event
 
 
@@ -26,13 +26,10 @@ class ConfigTests(unittest.TestCase):
     def test_from_env(self):
         cfg = Config.from_env({"HINDSIGHT_URL": "https://h/", "HINDSIGHT_BANK": "b",
                                "FORWARDER_CHATS": "a@s.whatsapp.net, g@g.us", "FORWARDER_INCLUDE_FROM_ME": "false",
-                               "FORWARDER_SESSION_GAP_DAYS": "3", "FORWARDER_MAX_MESSAGES": "50",
                                "FORWARDER_OWNER_NAME": "Charles", "STATE_DIRECTORY": "/var/lib/x"})
         self.assertEqual(cfg.retain_url, "https://h/v1/default/banks/b/memories")
         self.assertEqual(cfg.chats, {"a@s.whatsapp.net", "g@g.us"})
         self.assertFalse(cfg.include_from_me)
-        self.assertEqual(cfg.session_gap.days, 3)
-        self.assertEqual(cfg.max_messages, 50)
         self.assertEqual(cfg.owner_name, "Charles")
         self.assertEqual(cfg.state_dir, Path("/var/lib/x"))
 
@@ -82,54 +79,39 @@ class ContextTests(unittest.TestCase):
         self.assertTrue(ctx.endswith("Household logistics."))
 
 
-class SessionTests(unittest.TestCase):
-    def test_first_message_starts_a_document_named_for_its_time(self):
+class DocumentTests(unittest.TestCase):
+    def test_first_message_opens_a_document_and_the_rest_join_it(self):
         state = State(Path(tempfile.mkdtemp()) / "state.json")
-        session, started = session_for(forwarding_config(), state, ev(1, timestamp="2026-09-12T19:29:35Z"))
-        self.assertTrue(started)
-        self.assertEqual(session.document_id, "whatsapp:c@s.whatsapp.net:20260912T192935Z")
+        document, opened = document_for(state, ev(1))
+        self.assertTrue(opened)
+        self.assertTrue(document.startswith("whatsapp:c@s.whatsapp.net:"))
+        state.documents["c@s.whatsapp.net"] = document
+        self.assertEqual(document_for(state, ev(2, timestamp="2027-01-01T10:00:00Z")), (document, False))
 
-    def test_recent_message_appends_to_the_same_document(self):
-        cfg, state = forwarding_config(), State(Path(tempfile.mkdtemp()) / "state.json")
-        first, _ = session_for(cfg, state, ev(1, timestamp="2026-09-12T10:00:00Z"))
-        first.last_timestamp, first.messages = "2026-09-12T10:00:00Z", 1
-        state.sessions["c@s.whatsapp.net"] = first
-        session, started = session_for(cfg, state, ev(2, timestamp="2026-09-13T10:00:00Z"))
-        self.assertFalse(started)
-        self.assertEqual(session.document_id, first.document_id)
-
-    def test_a_weeks_silence_starts_a_new_document(self):
-        cfg, state = forwarding_config(), State(Path(tempfile.mkdtemp()) / "state.json")
-        first, _ = session_for(cfg, state, ev(1, timestamp="2026-09-01T10:00:00Z"))
-        first.last_timestamp, first.messages = "2026-09-01T10:00:00Z", 3
-        state.sessions["c@s.whatsapp.net"] = first
-        session, started = session_for(cfg, state, ev(2, timestamp="2026-09-08T10:00:01Z"))
-        self.assertTrue(started)
-        self.assertNotEqual(session.document_id, first.document_id)
-
-    def test_a_full_document_rolls_over(self):
-        cfg = forwarding_config(max_messages=2)
-        state = State(Path(tempfile.mkdtemp()) / "state.json")
-        first, _ = session_for(cfg, state, ev(1))
-        first.last_timestamp, first.messages = "2026-09-12T10:00:00Z", 2
-        state.sessions["c@s.whatsapp.net"] = first
-        session, started = session_for(cfg, state, ev(2, timestamp="2026-09-12T10:01:00Z"))
-        self.assertTrue(started)
-        self.assertNotEqual(session.document_id, first.document_id)
+    def test_a_wiped_state_opens_a_new_document_it_can_never_replace_an_old_one(self):
+        """The failure this guards: a rebuilt id would REPLACE the old document."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "state.json"
+            first, _ = document_for(State(path), ev(1))
+            State(path).documents["c@s.whatsapp.net"] = first
+            path.unlink(missing_ok=True)
+            replayed, opened = document_for(State(path), ev(1))
+        self.assertTrue(opened)
+        self.assertNotEqual(replayed, first)
 
 
 class RetainItemTests(unittest.TestCase):
     def test_first_item_replaces_and_later_ones_append(self):
         cfg = forwarding_config()
         state = State(Path(tempfile.mkdtemp()) / "state.json")
-        session, started = session_for(cfg, state, ev(9, sender_name="Bob", chat_name="Bob", content="x"))
-        item = retain_item(cfg, ev(9, sender_name="Bob", chat_name="Bob", content="x"), session, started)
+        document, opened = document_for(state, ev(9))
+        item = retain_item(cfg, ev(9, sender_name="Bob", chat_name="Bob", content="x"), document, opened)
         self.assertNotIn("update_mode", item)
-        self.assertEqual(item["document_id"], session.document_id)
+        self.assertEqual(item["document_id"], document)
         self.assertEqual(item["timestamp"], "2026-09-12T10:00:00Z")
         self.assertEqual(item["metadata"]["event_id"], "9")
         self.assertEqual(item["tags"], ["source:whatsapp", "chat:c@s.whatsapp.net"])
-        self.assertEqual(retain_item(cfg, ev(10), session, False)["update_mode"], "append")
+        self.assertEqual(retain_item(cfg, ev(10), document, False)["update_mode"], "append")
 
 
 class StateTests(unittest.TestCase):
@@ -139,12 +121,11 @@ class StateTests(unittest.TestCase):
             state = State(path)
             self.assertEqual(state.cursor, 0)
             state.cursor = 42
-            state.sessions["c@s.whatsapp.net"] = session = Session("doc", "2026-09-12T10:00:00Z", 3)
+            state.documents["c@s.whatsapp.net"] = "whatsapp:c@s.whatsapp.net:20260912T100000Z-abc123"
             state.save()
             reloaded = State(path)
             self.assertEqual(reloaded.cursor, 42)
-            self.assertEqual(reloaded.sessions["c@s.whatsapp.net"].document_id, session.document_id)
-            self.assertEqual(reloaded.sessions["c@s.whatsapp.net"].messages, 3)
+            self.assertEqual(reloaded.documents, state.documents)
             path.write_text("junk")
             self.assertEqual(State(path).cursor, 0)
 
@@ -195,7 +176,7 @@ class RunTests(unittest.TestCase):
                       ev(3, sender_name="Gaby", chat_name="Gaby", content="b", timestamp="2026-09-12T10:05:00Z")]
             run(cfg, wa=None, hs=hs, state=state, events=iter(events))
             self.assertEqual(state.cursor, 3)
-            self.assertEqual(State(Path(d) / "state.json").sessions["c@s.whatsapp.net"].messages, 2)
+            self.assertEqual(State(Path(d) / "state.json").documents["c@s.whatsapp.net"], posted[0]["document_id"])
         self.assertEqual([p["content"] for p in posted], ["[2026-09-12 10:00] Gaby: a", "[2026-09-12 10:05] Gaby: b"])
         self.assertEqual([p.get("update_mode") for p in posted], [None, "append"])
         self.assertEqual(posted[0]["document_id"], posted[1]["document_id"])

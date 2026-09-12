@@ -20,10 +20,10 @@ that it is given everything.
   WhatsApp account between Charles and Gaby. Each line is `[date time]
   Speaker: message`…"*. `FORWARDER_OWNER_NAME` and `FORWARDER_ACCOUNT_LABEL`
   fill in the names; `HINDSIGHT_CONTEXT_EXTRA` adds a sentence of your own.
-- **Documents roll over** so no document grows without bound: a chat idle for
-  `FORWARDER_SESSION_GAP_DAYS` (7) starts a new one, and so does one that has
-  reached `FORWARDER_MAX_MESSAGES` (200). The document id carries the time the
-  document opened: `whatsapp:<chat_jid>:20260912T192935Z`.
+- **A document is never closed.** Append costs the new chunk, not the
+  document, so a chat is one document for as long as it lasts. The id carries
+  the time it was opened plus a random suffix:
+  `whatsapp:<chat_jid>:20260912T192935Z-4f1a9c`.
 - Voice notes arrive already transcribed (the bridge publishes them only once
   the transcript is in), so each note is one line of the transcript.
 
@@ -36,6 +36,16 @@ sent, the sessions say what it was appended to.
 
 Losing that file is not neutral — with `append`, replaying an event **adds the
 line a second time** instead of replacing it, so the directory belongs on the
-container's state volume, never on a cattle rootfs. A Hindsight outage is
-safe: the state advances only after retain returns, so recovery replays at
-most the message in flight.
+container's state volume, never on a cattle rootfs.
+
+Losing it anyway is survivable by construction: every chat simply opens a new
+document and carries on, and the old one keeps the history it already holds.
+That is what the random suffix in the id buys. Derive the id from the chat and
+a message instead and a wiped state, replaying the same events, rebuilds the
+*previous* id — and a first write replaces, so it would delete a document the
+event log can no longer refill. The cost of a wipe is therefore a seam in the
+bank (and whatever the event log replays appearing in both documents), never a
+deletion.
+
+A Hindsight outage is safe: the state advances only after retain returns, so
+recovery replays at most the message in flight.

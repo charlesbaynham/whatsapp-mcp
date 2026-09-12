@@ -7,9 +7,9 @@ replay on recovery, never loss.
 A chat is retained as a *running transcript*, not as isolated messages: each
 message is appended to the chat's current Hindsight document (update_mode
 "append", which reprocesses only the new chunk), so facts are extracted with
-the conversation around them. A document is closed and a new one started when
-the chat has been idle for `FORWARDER_SESSION_GAP_DAYS`, or once it holds
-`FORWARDER_MAX_MESSAGES`, so a busy chat never grows without bound.
+the conversation around them. A document grows for as long as the chat does;
+append costs the new chunk, not the document, so there is no reason to close
+one. Losing the state opens a fresh document per chat and carries on.
 
 Configuration (environment):
   WHATSAPP_BRIDGE_URL      unix:/run/whatsapp/bridge.sock or http://host:port
@@ -20,11 +20,9 @@ Configuration (environment):
   HINDSIGHT_CONTEXT_EXTRA  Sentence appended to every generated context
   FORWARDER_OWNER_NAME     How the account owner is named in transcripts (default: Me)
   FORWARDER_ACCOUNT_LABEL  Which WhatsApp account this is, named in the context
-  FORWARDER_SESSION_GAP_DAYS  Idle gap that starts a new document (default: 7)
-  FORWARDER_MAX_MESSAGES   Messages per document before rollover (default: 200)
   FORWARDER_CHATS          Comma-separated chat JIDs to forward; empty = every chat
   FORWARDER_INCLUDE_FROM_ME  Forward your own messages too (default: true)
-  FORWARDER_STATE_DIR      Where the cursor and per-chat sessions live
+  FORWARDER_STATE_DIR      Where the cursor and per-chat open documents live
                            (default: $STATE_DIRECTORY or .)
 """
 
@@ -33,11 +31,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -57,8 +56,6 @@ class Config:
     context_extra: str = ""
     owner_name: str = "Me"
     account_label: str = ""
-    session_gap_days: float = 7.0
-    max_messages: int = 200
     chats: Set[str] = field(default_factory=set)
     include_from_me: bool = True
     state_dir: Path = Path(".")
@@ -74,8 +71,6 @@ class Config:
             context_extra=env.get("HINDSIGHT_CONTEXT_EXTRA", "").strip(),
             owner_name=env.get("FORWARDER_OWNER_NAME", "Me").strip() or "Me",
             account_label=env.get("FORWARDER_ACCOUNT_LABEL", "").strip(),
-            session_gap_days=float(env.get("FORWARDER_SESSION_GAP_DAYS") or 7),
-            max_messages=int(env.get("FORWARDER_MAX_MESSAGES") or 200),
             chats=chats,
             include_from_me=env.get("FORWARDER_INCLUDE_FROM_ME", "true").lower() not in ("0", "false", "no"),
             state_dir=Path(env.get("FORWARDER_STATE_DIR") or env.get("STATE_DIRECTORY") or "."),
@@ -85,27 +80,11 @@ class Config:
     def retain_url(self) -> str:
         return self.hindsight_url + self.retain_path.format(bank=self.bank)
 
-    @property
-    def session_gap(self) -> timedelta:
-        return timedelta(days=self.session_gap_days)
-
-
-@dataclass
-class Session:
-    """The Hindsight document a chat is currently being appended to."""
-
-    document_id: str
-    last_timestamp: str = ""
-    messages: int = 0
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {"document_id": self.document_id, "last_timestamp": self.last_timestamp, "messages": self.messages}
-
 
 class State:
-    """Cursor and per-chat sessions, persisted together and atomically.
+    """Cursor and per-chat open documents, persisted together and atomically.
 
-    They must move as one: the cursor says what has been sent, the sessions
+    They must move as one: the cursor says what has been sent, the documents
     say what it was appended to, and an append replayed against the wrong
     document duplicates text rather than replacing it.
     """
@@ -113,7 +92,7 @@ class State:
     def __init__(self, path: Path):
         self.path = path
         self.cursor = 0
-        self.sessions: Dict[str, Session] = {}
+        self.documents: Dict[str, str] = {}
         self.load()
 
     def load(self) -> None:
@@ -125,23 +104,12 @@ class State:
             log.warning("state file %s is unreadable; starting from scratch", self.path)
             return
         self.cursor = int(raw.get("cursor") or 0)
-        self.sessions = {
-            jid: Session(
-                document_id=str(s.get("document_id") or ""),
-                last_timestamp=str(s.get("last_timestamp") or ""),
-                messages=int(s.get("messages") or 0),
-            )
-            for jid, s in (raw.get("sessions") or {}).items()
-            if s.get("document_id")
-        }
+        self.documents = {jid: str(doc) for jid, doc in (raw.get("documents") or {}).items() if doc}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "cursor": self.cursor,
-            "sessions": {jid: s.as_dict() for jid, s in self.sessions.items()},
-        }))
+        tmp.write_text(json.dumps({"cursor": self.cursor, "documents": self.documents}))
         os.replace(tmp, self.path)
 
 
@@ -219,37 +187,35 @@ def describe(cfg: Config, msg: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def document_id(chat_jid: str, msg: Dict[str, Any]) -> str:
-    ts = parse_timestamp(str(msg.get("timestamp") or "")) or datetime.now(timezone.utc)
-    return f"whatsapp:{chat_jid}:{ts.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+def new_document_id(chat_jid: str, *, now=None) -> str:
+    """A document id no later run can reproduce.
 
-
-def session_for(cfg: Config, state: State, ev: Event) -> tuple[Session, bool]:
-    """The document this message belongs to, and whether it starts a new one.
-
-    A new document when the chat has been idle longer than the session gap, or
-    when the current one is full: a year-long chat must not become one
-    ever-growing document, and a fortnight's silence is a new conversation.
+    The random suffix is the whole point: if the id were derived from the chat
+    and a message, a wiped state replaying the same events would rebuild the
+    previous id and, being a first write, REPLACE that document — deleting a
+    history the event log can no longer supply. A fresh id can only ever be
+    created, so a lost state costs a seam in the bank, never a deletion.
     """
-    msg = ev.payload
-    chat_jid = ev.chat_jid
-    current = state.sessions.get(chat_jid)
-    if current:
-        previous = parse_timestamp(current.last_timestamp)
-        now = parse_timestamp(str(msg.get("timestamp") or ""))
-        idle = previous and now and (now - previous) >= cfg.session_gap
-        if not idle and current.messages < cfg.max_messages:
-            return current, False
-        log.info("rolling over %s (%s)", chat_jid, "idle" if idle else f"{current.messages} messages")
-    return Session(document_id=document_id(chat_jid, msg)), True
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"whatsapp:{chat_jid}:{stamp}-{secrets.token_hex(3)}"
 
 
-def retain_item(cfg: Config, ev: Event, session: Session, started: bool) -> Dict[str, Any]:
+def document_for(state: State, ev: Event) -> tuple[str, bool]:
+    """The document this message is appended to, and whether this opens it."""
+    document = state.documents.get(ev.chat_jid)
+    if document:
+        return document, False
+    document = new_document_id(ev.chat_jid)
+    log.info("opening %s for %s", document, ev.chat_jid)
+    return document, True
+
+
+def retain_item(cfg: Config, ev: Event, document: str, opened: bool) -> Dict[str, Any]:
     msg = ev.payload
     item: Dict[str, Any] = {
         "content": transcript_line(cfg, msg),
         "context": describe(cfg, msg),
-        "document_id": session.document_id,
+        "document_id": document,
         "metadata": {
             "source": "whatsapp",
             "chat_jid": str(msg.get("chat_jid") or ""),
@@ -261,7 +227,7 @@ def retain_item(cfg: Config, ev: Event, session: Session, started: bool) -> Dict
         },
         "tags": ["source:whatsapp", f"chat:{msg.get('chat_jid')}"],
     }
-    if not started:
+    if not opened:
         item["update_mode"] = "append"
     if msg.get("timestamp"):
         item["timestamp"] = msg["timestamp"]
@@ -294,12 +260,10 @@ def retain_with_retry(hs: Hindsight, items: List[Dict[str, Any]], *, sleep=time.
 
 
 def forward(cfg: Config, hs: Hindsight, state: State, ev: Event) -> None:
-    session, started = session_for(cfg, state, ev)
-    retain_with_retry(hs, [retain_item(cfg, ev, session, started)])
-    session.messages += 1
-    session.last_timestamp = str(ev.payload.get("timestamp") or session.last_timestamp)
-    state.sessions[ev.chat_jid] = session
-    log.info("retained event %d into %s (%d messages)", ev.id, session.document_id, session.messages)
+    document, opened = document_for(state, ev)
+    retain_with_retry(hs, [retain_item(cfg, ev, document, opened)])
+    state.documents[ev.chat_jid] = document
+    log.info("retained event %d into %s", ev.id, document)
 
 
 def run(cfg: Config, wa: WhatsAppClient, hs: Hindsight, state: State, *, events: Optional[Iterable[Event]] = None) -> None:
