@@ -119,8 +119,8 @@ class State:
             raw = json.loads(self.path.read_text())
         except FileNotFoundError:
             return
-        except (ValueError, OSError):
-            log.warning("state file %s is unreadable; starting from scratch", self.path)
+        except ValueError:
+            log.warning("state file %s is corrupt; starting from scratch", self.path)
             return
         self.cursor = int(raw.get("cursor") or 0)
         self.documents = {jid: str(doc) for jid, doc in (raw.get("documents") or {}).items() if doc}
@@ -307,6 +307,14 @@ def main() -> None:
     wa = WhatsAppClient()
     hs = Hindsight(cfg)
     state = State(cfg.state_dir / "state.json")
+    # Prove the state is writable before consuming a single event: retaining
+    # first and failing to record it afterwards replays on restart, and with
+    # append that duplicates rather than replaces.
+    try:
+        state.save()
+    except OSError as e:
+        log.error("state directory %s is not usable (%s); refusing to forward", cfg.state_dir, e)
+        raise SystemExit(1)
     while True:
         try:
             run(cfg, wa, hs, state)

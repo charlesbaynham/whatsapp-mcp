@@ -136,6 +136,14 @@ class StateTests(unittest.TestCase):
             path.write_text("junk")
             self.assertEqual(State(path).cursor, 0)
 
+    def test_an_unusable_state_dir_raises_rather_than_starting_from_scratch(self):
+        """Silently starting from scratch here is how one message became ten documents."""
+        with tempfile.TemporaryDirectory() as d:
+            blocker = Path(d) / "blocker"
+            blocker.write_text("")
+            with self.assertRaises(OSError):
+                State(blocker / "state.json").save()
+
 
 class RetainTests(unittest.TestCase):
     def test_posts_items_with_bearer(self):
