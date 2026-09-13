@@ -213,10 +213,13 @@ in
     } // lib.mapAttrs' (name: client: lib.nameValuePair client.user { }) cfg.clients;
 
     systemd.tmpfiles.rules = [
-      "d ${cfg.stateDir} 0750 ${cfg.user} ${cfg.user} -"
+      # 0751: a client runs as its own user and is in no shared group, so it
+      # needs to traverse these to reach its own 0700 directory below. Execute
+      # without read keeps the contents unlistable, and the store stays 0750.
+      "d ${cfg.stateDir} 0751 ${cfg.user} ${cfg.user} -"
       "d ${storeDir}     0750 ${cfg.user} ${cfg.user} -"
       "d ${storeDir}/tmp 0750 ${cfg.user} ${cfg.user} -"
-      "d ${cfg.stateDir}/clients 0750 ${cfg.user} ${cfg.user} -"
+      "d ${cfg.stateDir}/clients 0751 ${cfg.user} ${cfg.user} -"
     ] ++ lib.mapAttrsToList (name: client: "d ${clientStateDir name} 0700 ${client.user} ${client.user} -")
       (lib.filterAttrs (name: client: client.needsState) cfg.clients);
 
