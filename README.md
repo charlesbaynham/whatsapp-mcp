@@ -102,27 +102,36 @@ own user, admitted to the socket by group membership and nothing else.
 | `WHATSAPP_BRIDGE_ADDR` | `127.0.0.1:8080` | Listen address: a TCP `host:port`, or `unix:/path/to.sock` (mode 0660) |
 | `WHATSAPP_BRIDGE_SOCKET_GROUP` | unset | With a Unix socket, chgrp it to this group so clients are admitted by membership |
 | `WHATSAPP_LOG_MESSAGE_BODIES` | unset | Set to `1` to log message content to stdout; by default only metadata (timestamp, direction, chat, media type) is logged |
-| `WHATSAPP_SEND_GAP_MEAN_SECONDS` | `30` | Mean gap the outbound rate limit holds between sends, drawn Poisson per message. `0` disables the limit |
-| `WHATSAPP_SEND_MAX_QUEUE_WAIT_SECONDS` | `300` | Refuse a send outright once the queue ahead of it is deeper than this. `0` means no cap |
+| `WHATSAPP_SEND_GAP_MEAN_SECONDS` | `30` | Mean gap the outbound rate limit holds between sends, drawn Exponential per message. `0` disables the limit |
+| `WHATSAPP_SEND_MAX_QUEUE_DEPTH` | `100` | Submissions accepted before the queue is full and further ones are refused |
 | `WHATSAPP_TRANSCRIBE` | unset | Set to `1` to transcribe incoming voice notes locally with whisper.cpp |
 | `WHATSAPP_WHISPER_MODEL` | `<store>/models/ggml-base.bin` | whisper.cpp model file; downloaded on first use if missing |
 | `WHATSAPP_WHISPER_BIN` | `whisper-cli` | whisper.cpp binary name or path |
 
 ### Outbound rate limiting
 
-Sends are serialised behind a gate that spaces them by a Poisson-distributed
-number of seconds (mean `WHATSAPP_SEND_GAP_MEAN_SECONDS`, default 30). The
-first send after an idle period goes immediately; anything arriving while the
-gate is closed **queues in arrival order** and is sent when its turn comes, so
-a caller sees a slow response rather than a dropped message. A request whose
-turn is further off than `WHATSAPP_SEND_MAX_QUEUE_WAIT_SECONDS` is refused with
-`503` instead of being held indefinitely, and a caller that disconnects while
-queued gives up its slot without sending.
+Sends are **asynchronous by default**. `POST /api/send` puts the message on a
+queue and answers `202` immediately with `{success, queued: true, id}`; a single
+worker sends them one at a time, spacing each by an **exponential** gap (mean
+`WHATSAPP_SEND_GAP_MEAN_SECONDS`, default 30 s) — the inter-arrival time of a
+Poisson process, so the traffic has the shape of someone typing rather than of a
+metronome. Most gaps land under the mean, the occasional one is much longer.
+
+`GET /api/send/{id}` reports how a submission went: `state` is `queued`, `sent`
+or `failed`, with the bridge's own reason on a failure. Only recent sends are
+kept, so an unknown id has aged out rather than failed.
+
+Pass `block: true` to wait for the message to actually leave and get the send's
+real outcome instead. The wait is the rate limit's, so it can run to minutes. A
+blocking caller that gives up loses only the outcome — the message is already
+queued and still goes out.
+
+Once `WHATSAPP_SEND_MAX_QUEUE_DEPTH` submissions are outstanding, further ones
+are refused with `503` rather than queued behind an hour of backlog.
 
 This exists because WhatsApp unlinked a bridge's device mid-way through a burst
 of rapid first-contact messages: to their heuristics, a linked device sending
-back-to-back is a spammer. The interval is random rather than fixed for the
-same reason — a metronome is as machine-like as no pause at all.
+back-to-back is a spammer.
 
 The REST API is documented in [`docs/bridge-api.md`](docs/bridge-api.md). It
 starts before the QR/pairing step, so `GET /api/status` is answerable

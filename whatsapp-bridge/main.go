@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -332,6 +331,10 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// ID identifies the submission at GET /api/send/{id}. Queued is true when
+	// the message was accepted but not yet sent, which is the default.
+	ID     string `json:"id,omitempty"`
+	Queued bool   `json:"queued,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -342,6 +345,9 @@ type SendMessageRequest struct {
 	// VoiceNote sends the media as a playable WhatsApp voice message,
 	// transcoding it to Ogg Opus with ffmpeg first if it isn't one already.
 	VoiceNote bool `json:"voice_note,omitempty"`
+	// Block waits for the message to actually go out rather than returning as
+	// soon as it is queued. The wait is the rate limit's, so it can be minutes.
+	Block bool `json:"block,omitempty"`
 	// uploadName is the original filename of a multipart upload, used as the
 	// document title instead of the temp file's name.
 	uploadName string
@@ -930,10 +936,14 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 	dispatcher := pub.dispatcher
-	gate := newSendGateFromEnv()
+
+	queue := newSendQueue(newSendGateFromEnv(), func(ctx context.Context, req SendMessageRequest) (bool, string) {
+		return sendWhatsAppMedia(ctx, client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
+	})
+	go queue.run(queueCtx)
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
 	registerReadRoutes(mux, messageStore)
@@ -987,37 +997,65 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *
 			fmt.Println("Received request to send message to", req.Recipient)
 		}
 
-		queued, err := gate.wait(r.Context())
-		if err != nil {
-			// Nothing has been sent: refuse rather than deliver late.
-			status := http.StatusServiceUnavailable
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				status = http.StatusRequestTimeout
-			}
-			fmt.Printf("Send not made after %s queued: %v\n", queued.Round(time.Second), err)
+		// The queue owns the job from here: it outlives this request, so the
+		// uploaded temp file must not be removed when the handler returns.
+		job, queued := queue.submit(req, cleanup)
+		if !queued {
+			cleanup()
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
+			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(SendMessageResponse{
 				Success: false,
-				Message: fmt.Sprintf("Not sent: %v", err),
+				Message: "Send queue is full; the rate limit is still working through the backlog",
 			})
 			return
 		}
-		if queued > 0 {
-			fmt.Println("Send held by rate limit for", queued.Round(time.Second))
-		}
-
-		success, message := sendWhatsAppMedia(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
-		fmt.Println("Message sent", success, message)
+		cleanup = func() {} // the job runs it after the send
 
 		w.Header().Set("Content-Type", "application/json")
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
+		if !req.Block {
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: true,
+				Queued:  true,
+				ID:      job.id,
+				Message: fmt.Sprintf("Queued as %s, %d ahead of it", job.id, queue.pending()-1),
+			})
+			return
 		}
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
+
+		select {
+		case res := <-job.done:
+			if !res.Success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: res.Success,
+				Message: res.Message,
+				ID:      res.ID,
+			})
+		case <-r.Context().Done():
+			// The caller gave up waiting; the message is still queued and will
+			// go out, so this is not a failure to send.
+			fmt.Printf("Caller stopped waiting for %s; it stays queued\n", job.id)
+		}
+	})
+
+	// Handler for the outcome of a submission
+	mux.HandleFunc("/api/send/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/send/")
+		res, ok := queue.result(id)
+		w.Header().Set("Content-Type", "application/json")
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no such send id"})
+			return
+		}
+		json.NewEncoder(w).Encode(res)
 	})
 
 	// Handler for downloading media
@@ -1356,7 +1394,7 @@ func main() {
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
+	server := startRESTServer(ctx, client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {

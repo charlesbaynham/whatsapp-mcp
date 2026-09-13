@@ -18,8 +18,8 @@ for ev in wa.events(since=0):
 `WHATSAPP_BRIDGE_URL` is either `unix:/path/to/bridge.sock` or an
 `http://host:port` URL (a trailing `/api` is tolerated).
 
-`send_message` / `send_file` can block for several minutes: the bridge
-rate-limits outbound sends and queues anything that arrives early, so a call
-returns when the message actually goes out. Their timeout is set above the
-bridge's queue cap deliberately — hanging up early drops the queued message
-rather than sending it.
+`send_message` / `send_file` return as soon as the bridge has **queued** the
+message — sends are rate limited and go out a randomised delay later. The
+returned `id` reads back through `send_status(id)` (`queued`, `sent`, `failed`).
+Pass `block=True` to wait for the send itself instead; that can take minutes,
+and giving up on the wait loses only the outcome, not the message.

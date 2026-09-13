@@ -210,21 +210,49 @@ def get_message_context(
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    block: bool = False
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
+
+    Sending is rate limited and asynchronous: this returns as soon as the bridge
+    has queued the message, with `queued: true` and an `id` you can pass to
+    get_send_status. The message goes out a short, randomised delay later — that
+    spacing is deliberate, it keeps WhatsApp from unlinking the account for
+    behaving like a bulk sender.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
+        block: Wait for the message to actually leave and return the send's own
+                 outcome instead of queueing (default False). The wait is the rate
+                 limit's and can run to minutes, so only pass True when the
+                 outcome must be known before doing anything else.
 
     Returns:
-        A dictionary containing success status and a status message
+        A dictionary containing success status, a status message, and the
+        submission id
     """
     if not recipient:
         return {"success": False, "message": "Recipient must be provided"}
-    return _result(lambda: wa.send_message(recipient, message))
+    return _result(lambda: wa.send_message(recipient, message, block=block))
+
+
+@mcp.tool()
+def get_send_status(send_id: str) -> Dict[str, Any]:
+    """Look up how a queued send went, by the id send_message returned.
+
+    `state` is queued (still waiting behind the rate limit), sent, or failed;
+    `message` carries the bridge's own reason on a failure. Only recent sends
+    are kept, so an unknown id means it has aged out, not that it failed.
+
+    Args:
+        send_id: The id returned by send_message, send_file or send_audio_message
+    """
+    if not send_id:
+        return {"success": False, "message": "send_id must be provided"}
+    return _result(lambda: wa.send_status(send_id))
 
 
 @mcp.tool()
@@ -252,8 +280,14 @@ def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_file(recipient: str, media_path: str, block: bool = False) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
+
+    Sending is rate limited and asynchronous: this returns as soon as the bridge
+    has queued the message, with `queued: true` and an `id` you can pass to
+    get_send_status. The message goes out a short, randomised delay later — that
+    spacing is deliberate, it keeps WhatsApp from unlinking the account for
+    behaving like a bulk sender.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
@@ -261,31 +295,45 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
         media_path: The absolute path to the media file to send (image, video, document). Either a
                  file this server can read (it is uploaded to the bridge) or a path inside the
                  bridge's store directory, e.g. one returned by download_media.
+        block: Wait for the message to actually leave and return the send's own
+                 outcome instead of queueing (default False). The wait is the rate
+                 limit's and can run to minutes, so only pass True when the
+                 outcome must be known before doing anything else.
 
     Returns:
         A dictionary containing success status and a status message
     """
     if not recipient or not media_path:
         return {"success": False, "message": "recipient and media_path must be provided"}
-    return _result(lambda: wa.send_file(recipient, path=media_path))
+    return _result(lambda: wa.send_file(recipient, path=media_path, block=block))
 
 
 @mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_audio_message(recipient: str, media_path: str, block: bool = False) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp voice message to the specified recipient. For group messages use the JID. The bridge converts it to Opus .ogg with ffmpeg if needed; if that fails, use send_file instead.
+
+    Sending is rate limited and asynchronous: this returns as soon as the bridge
+    has queued the message, with `queued: true` and an `id` you can pass to
+    get_send_status. The message goes out a short, randomised delay later — that
+    spacing is deliberate, it keeps WhatsApp from unlinking the account for
+    behaving like a bulk sender.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the audio file to send. Either a file this server can read
                  (it is uploaded to the bridge) or a path inside the bridge's store directory.
+        block: Wait for the message to actually leave and return the send's own
+                 outcome instead of queueing (default False). The wait is the rate
+                 limit's and can run to minutes, so only pass True when the
+                 outcome must be known before doing anything else.
 
     Returns:
         A dictionary containing success status and a status message
     """
     if not recipient or not media_path:
         return {"success": False, "message": "recipient and media_path must be provided"}
-    return _result(lambda: wa.send_file(recipient, path=media_path, voice_note=True))
+    return _result(lambda: wa.send_file(recipient, path=media_path, voice_note=True, block=block))
 
 
 @mcp.tool()

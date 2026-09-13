@@ -39,12 +39,19 @@ func parseSendRequest(r *http.Request, storeDir string) (SendMessageRequest, fun
 		Message:   r.FormValue("message"),
 		MediaPath: r.FormValue("media_path"),
 	}
-	if v := r.FormValue("voice_note"); v != "" {
+	for _, f := range []struct {
+		name string
+		dest *bool
+	}{{"voice_note", &req.VoiceNote}, {"block", &req.Block}} {
+		v := r.FormValue(f.name)
+		if v == "" {
+			continue
+		}
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			return req, noop, fmt.Errorf("voice_note must be true or false")
+			return req, noop, fmt.Errorf("%s must be true or false", f.name)
 		}
-		req.VoiceNote = b
+		*f.dest = b
 	}
 
 	file, header, err := r.FormFile("file")

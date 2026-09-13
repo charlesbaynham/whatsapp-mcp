@@ -23,6 +23,32 @@ func TestParseSendRequestJSON(t *testing.T) {
 	}
 }
 
+func TestParseSendRequestDefaultsToAsync(t *testing.T) {
+	r := httptest.NewRequest("POST", "/api/send", strings.NewReader(`{"recipient":"123","message":"hi"}`))
+	r.Header.Set("Content-Type", "application/json")
+	req, cleanup, err := parseSendRequest(r, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if req.Block {
+		t.Error("a send with no block field must queue rather than block")
+	}
+}
+
+func TestParseSendRequestRejectsNonBooleanBlock(t *testing.T) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	mw.WriteField("recipient", "123")
+	mw.WriteField("block", "sometimes")
+	mw.Close()
+	r := httptest.NewRequest("POST", "/api/send", &body)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	if _, _, err := parseSendRequest(r, t.TempDir()); err == nil {
+		t.Fatal("block=sometimes was accepted")
+	}
+}
+
 func TestParseSendRequestMultipart(t *testing.T) {
 	store := t.TempDir()
 	var body bytes.Buffer
@@ -30,6 +56,7 @@ func TestParseSendRequestMultipart(t *testing.T) {
 	mw.WriteField("recipient", "123@s.whatsapp.net")
 	mw.WriteField("message", "caption")
 	mw.WriteField("voice_note", "false")
+	mw.WriteField("block", "true")
 	fw, _ := mw.CreateFormFile("file", "../../evil/report.pdf")
 	fw.Write([]byte("%PDF-1.4"))
 	mw.Close()
@@ -40,7 +67,7 @@ func TestParseSendRequestMultipart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.Recipient != "123@s.whatsapp.net" || req.Message != "caption" || req.VoiceNote {
+	if req.Recipient != "123@s.whatsapp.net" || req.Message != "caption" || req.VoiceNote || !req.Block {
 		t.Errorf("parsed %+v", req)
 	}
 	if req.uploadName != "report.pdf" {
