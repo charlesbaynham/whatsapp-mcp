@@ -41,7 +41,7 @@ last_is_from_me, unread_count, last_read_at, is_group`.
 
 | Method | Path | Body | Notes |
 | --- | --- | --- | --- |
-| POST | `/send` | JSON `{recipient, message, media_path?, voice_note?}` or `multipart/form-data` with the same fields plus a `file` part | `media_path` must lie inside the store; an upload needs no store access. `voice_note: true` transcodes to Ogg Opus with ffmpeg and sends a playable voice message. Text-only sends are just `{recipient, message}`. |
+| POST | `/send` | JSON `{recipient, message, media_path?, voice_note?}` or `multipart/form-data` with the same fields plus a `file` part | `media_path` must lie inside the store; an upload needs no store access. `voice_note: true` transcodes to Ogg Opus with ffmpeg and sends a playable voice message. Text-only sends are just `{recipient, message}`. **Rate limited**: sends are spaced by a Poisson gap (mean `WHATSAPP_SEND_GAP_MEAN_SECONDS`, default 30 s) and queue in arrival order, so this call can block for the length of the queue ahead of it. `503` once that queue is deeper than `WHATSAPP_SEND_MAX_QUEUE_WAIT_SECONDS`; `408` if the caller goes away while queued. Nothing is sent in either case. |
 | POST | `/download` | `{message_id, chat_jid}` | Downloads into the store; returns `{success, message, filename, path}` |
 | GET | `/media/{chat_jid}/{message_id}` | | Streams the attachment's bytes (downloading first if needed) |
 | POST | `/mark-read` | `{chat_jid, send_receipt}` | The only way read state changes. `send_receipt` sends real blue ticks. Emits `chat.read`. |

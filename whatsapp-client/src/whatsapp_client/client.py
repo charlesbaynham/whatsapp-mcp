@@ -21,6 +21,11 @@ UNIX_PLACEHOLDER_HOST = "http://whatsapp"
 
 REQUEST_TIMEOUT = 30.0
 MEDIA_TIMEOUT = 120.0
+# The bridge rate-limits outbound sends and queues anything arriving early, so a
+# send legitimately blocks for the queue ahead of it. This must stay above the
+# bridge's own WHATSAPP_SEND_MAX_QUEUE_WAIT_SECONDS (300 s), or the client hangs
+# up first and the queued message is dropped instead of sent.
+SEND_TIMEOUT = 420.0
 
 
 class BridgeError(Exception):
@@ -224,7 +229,8 @@ class WhatsAppClient:
     # --- sending ---
 
     def send_message(self, recipient: str, message: str) -> Dict[str, Any]:
-        return self._json("POST", "/send", json={"recipient": recipient, "message": message})
+        return self._json("POST", "/send", timeout=SEND_TIMEOUT,
+                          json={"recipient": recipient, "message": message})
 
     def send_file(
         self,
@@ -248,13 +254,13 @@ class WhatsAppClient:
         fields = {"recipient": recipient, "message": caption, "voice_note": "true" if voice_note else "false"}
         if data is not None:
             files = {"file": (filename or "upload", data)}
-            return self._json("POST", "/send", data=fields, files=files, timeout=MEDIA_TIMEOUT)
+            return self._json("POST", "/send", data=fields, files=files, timeout=SEND_TIMEOUT)
         assert path is not None
         if os.path.isfile(path) and os.access(path, os.R_OK):
             with open(path, "rb") as fh:
                 files = {"file": (filename or os.path.basename(path), fh)}
-                return self._json("POST", "/send", data=fields, files=files, timeout=MEDIA_TIMEOUT)
-        return self._json("POST", "/send", timeout=MEDIA_TIMEOUT, json={
+                return self._json("POST", "/send", data=fields, files=files, timeout=SEND_TIMEOUT)
+        return self._json("POST", "/send", timeout=SEND_TIMEOUT, json={
             "recipient": recipient, "message": caption, "media_path": path, "voice_note": voice_note})
 
     # --- media ---

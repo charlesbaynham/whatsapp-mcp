@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -932,6 +933,7 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 	dispatcher := pub.dispatcher
+	gate := newSendGateFromEnv()
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
 	registerReadRoutes(mux, messageStore)
@@ -983,6 +985,26 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *
 			fmt.Println("Received request to send message", req.Message, req.MediaPath)
 		} else {
 			fmt.Println("Received request to send message to", req.Recipient)
+		}
+
+		queued, err := gate.wait(r.Context())
+		if err != nil {
+			// Nothing has been sent: refuse rather than deliver late.
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusRequestTimeout
+			}
+			fmt.Printf("Send not made after %s queued: %v\n", queued.Round(time.Second), err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Not sent: %v", err),
+			})
+			return
+		}
+		if queued > 0 {
+			fmt.Println("Send held by rate limit for", queued.Round(time.Second))
 		}
 
 		success, message := sendWhatsAppMedia(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
