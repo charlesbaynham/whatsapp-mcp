@@ -8,6 +8,7 @@ that behind its Unix socket (or TCP loopback port on a laptop).
 import os
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -221,6 +222,9 @@ def send_message(
     spacing is deliberate, it keeps WhatsApp from unlinking the account for
     behaving like a bulk sender.
 
+    Sending more than one message? Use send_messages instead: it queues the
+    whole batch through the same path, in one tool call.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
@@ -237,6 +241,81 @@ def send_message(
     if not recipient:
         return {"success": False, "message": "Recipient must be provided"}
     return _result(lambda: wa.send_message(recipient, message, block=block))
+
+
+class OutgoingMessage(BaseModel):
+    """One message in a batch: who it goes to and what it says."""
+
+    recipient: str = Field(description=(
+        "Phone number with country code and no + or other symbols, or a JID "
+        '(e.g. "123456789@s.whatsapp.net", or a group JID like "123456789@g.us")'
+    ))
+    message: str = Field(description="The message text to send")
+
+
+@mcp.tool()
+def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
+    """Queue several WhatsApp messages in one call, to one recipient or many.
+
+    Same path as send_message — each message joins the bridge's send queue and
+    goes out behind the usual randomised spacing, in the order given — but as a
+    single tool call, so the whole batch is approved once rather than message by
+    message. Prefer it whenever you already know every message you want to send.
+
+    The batch is validated before anything is queued: one bad entry rejects the
+    lot and nothing goes out. After that each message is submitted in turn, and
+    submission stops at the first failure (a full queue or an unreachable
+    bridge) rather than leaving a hole in the middle of a conversation — the
+    ones already queued still go out, and the rest are reported as not
+    submitted so you can retry them.
+
+    Args:
+        messages: The messages to queue, each with a recipient and text
+
+    Returns:
+        `{success, message, queued, results}`, where `results` has one entry per
+        input message with its `recipient`, submission `id` and outcome. Pass an
+        id to get_send_status to see how that message actually went.
+    """
+    try:
+        # FastMCP hands over parsed models; a direct caller may pass dicts.
+        batch = [m if isinstance(m, OutgoingMessage) else OutgoingMessage.model_validate(m)
+                 for m in messages]
+    except Exception as e:
+        return {"success": False, "message": f"Malformed message in batch: {e}", "queued": 0, "results": []}
+
+    if not batch:
+        return {"success": False, "message": "No messages to send", "queued": 0, "results": []}
+    for i, item in enumerate(batch):
+        if not item.recipient:
+            return {"success": False, "message": f"Message {i} has no recipient; nothing was queued",
+                    "queued": 0, "results": []}
+        if not item.message:
+            return {"success": False, "message": f"Message {i} to {item.recipient} is empty; nothing was queued",
+                    "queued": 0, "results": []}
+
+    results: List[Dict[str, Any]] = []
+    queued = 0
+    halted = ""
+    for item in batch:
+        if halted:
+            results.append({"recipient": item.recipient, "success": False,
+                            "message": f"Not submitted: {halted}"})
+            continue
+        out = _result(lambda i=item: wa.send_message(i.recipient, i.message))
+        ok = bool(out.get("success"))
+        results.append({"recipient": item.recipient, "success": ok,
+                        "id": out.get("id"), "message": out.get("message", "")})
+        if ok:
+            queued += 1
+        else:
+            halted = out.get("message") or "an earlier message in the batch failed"
+
+    if queued == len(batch):
+        summary = f"Queued {queued} message(s); they go out spaced by the rate limit"
+    else:
+        summary = f"Queued {queued} of {len(batch)} message(s); submission stopped: {halted}"
+    return {"success": queued == len(batch), "message": summary, "queued": queued, "results": results}
 
 
 @mcp.tool()
