@@ -129,6 +129,13 @@ queued and still goes out.
 Once `WHATSAPP_SEND_MAX_QUEUE_DEPTH` submissions are outstanding, further ones
 are refused with `503` rather than queued behind an hour of backlog.
 
+The `send_messages` MCP tool submits a whole batch this way: one tool call, one
+approval, N messages onto the same queue in the order given, each still spaced
+by the rate limit. The batch is validated before anything is queued, and
+submission stops at the first refusal rather than leaving a gap mid-conversation
+— the messages already queued still go out, and the rest are reported back as
+not submitted.
+
 ⚠️ **The queue is in memory.** A restart or redeploy fails everything still
 waiting, naming each one in the log, and the `id`s of earlier sends are gone
 with it. Since a queued message can sit for minutes, a deploy mid-queue does
@@ -221,6 +228,7 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
+- **send_messages**: Queue several messages in one call — same queue, same spacing, one approval
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path

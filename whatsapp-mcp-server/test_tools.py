@@ -80,5 +80,52 @@ class ReshapeTests(unittest.TestCase):
             self.assertFalse(main.download_media("m", "c")["success"])
 
 
+class BatchSendTests(unittest.TestCase):
+    """send_messages queues each message through the ordinary send path."""
+
+    def test_queues_each_message_in_order(self):
+        replies = [{"success": True, "queued": True, "id": "snd-1"},
+                   {"success": True, "queued": True, "id": "snd-2"}]
+        with mock.patch.object(main.wa, "send_message", side_effect=replies) as sm:
+            out = main.send_messages([
+                {"recipient": "1", "message": "first"},
+                {"recipient": "2@g.us", "message": "second"},
+            ])
+        self.assertEqual([c.args for c in sm.call_args_list], [("1", "first"), ("2@g.us", "second")])
+        self.assertTrue(out["success"])
+        self.assertEqual(out["queued"], 2)
+        self.assertEqual([r["id"] for r in out["results"]], ["snd-1", "snd-2"])
+
+    def test_a_bad_entry_queues_nothing(self):
+        with mock.patch.object(main.wa, "send_message") as sm:
+            empty_text = main.send_messages([{"recipient": "1", "message": "hi"},
+                                             {"recipient": "2", "message": ""}])
+            no_recipient = main.send_messages([{"recipient": "", "message": "hi"}])
+            malformed = main.send_messages([{"recipient": "1"}])
+            empty_batch = main.send_messages([])
+        sm.assert_not_called()
+        for out in (empty_text, no_recipient, malformed, empty_batch):
+            self.assertFalse(out["success"])
+            self.assertEqual(out["queued"], 0)
+
+    def test_submission_stops_at_the_first_failure(self):
+        replies = [{"success": True, "queued": True, "id": "snd-1"},
+                   BridgeError("Send queue is full", status=503)]
+        with mock.patch.object(main.wa, "send_message", side_effect=replies) as sm:
+            out = main.send_messages([{"recipient": "1", "message": "a"},
+                                      {"recipient": "1", "message": "b"},
+                                      {"recipient": "1", "message": "c"}])
+        self.assertEqual(sm.call_count, 2)  # the third is never submitted
+        self.assertFalse(out["success"])
+        self.assertEqual(out["queued"], 1)
+        self.assertEqual([r["success"] for r in out["results"]], [True, False, False])
+        self.assertIn("queue is full", out["results"][2]["message"])
+
+    def test_accepts_parsed_models(self):
+        with mock.patch.object(main.wa, "send_message", return_value={"success": True, "id": "snd-1"}) as sm:
+            out = main.send_messages([main.OutgoingMessage(recipient="1", message="hi")])
+        sm.assert_called_once_with("1", "hi")
+        self.assertTrue(out["success"])
+
 if __name__ == "__main__":
     unittest.main()
