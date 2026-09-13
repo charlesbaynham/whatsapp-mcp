@@ -7,11 +7,9 @@ import (
 	"time"
 )
 
-// WhatsApp unlinked CT 119 on 2026-09-13 mid-way through a burst of
-// first-contact sends: a linked device that sends back-to-back looks like a
-// spammer to their heuristics. Outbound messages are therefore spaced by an
-// exponential gap — the inter-arrival time of a Poisson process, so the traffic
-// has the shape of someone typing rather than of a metronome.
+// A linked device sending back-to-back reads as a spammer and gets unlinked
+// (2026-09-13); the exponential gap is a Poisson process's inter-arrival time,
+// which has the shape of someone typing rather than of a metronome.
 const (
 	defaultGapMean = 30 * time.Second
 

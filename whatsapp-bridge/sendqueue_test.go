@@ -39,7 +39,7 @@ func TestSubmitReturnsBeforeTheSendHappens(t *testing.T) {
 		return true, "sent"
 	})
 
-	job, ok := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
+	job, _, ok := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
 	if !ok {
 		t.Fatal("submit refused an empty queue")
 	}
@@ -63,7 +63,7 @@ func TestBlockingCallerGetsTheOutcome(t *testing.T) {
 	q := newTestQueue(t, func(context.Context, SendMessageRequest) (bool, string) {
 		return false, "no LID found"
 	})
-	job, _ := q.submit(SendMessageRequest{Recipient: "447700900000", Block: true}, func() {})
+	job, _, _ := q.submit(SendMessageRequest{Recipient: "447700900000", Block: true}, func() {})
 	res := waitFor(t, job.done)
 	if res.Success || res.Message != "no LID found" {
 		t.Fatalf("result = %+v, want the failure passed through", res)
@@ -84,7 +84,7 @@ func TestCleanupRunsAfterTheSendNotBefore(t *testing.T) {
 	})
 
 	cleaned := make(chan struct{})
-	job, _ := q.submit(SendMessageRequest{Recipient: "447700900000", MediaPath: "/tmp/upload"}, func() {
+	job, _, _ := q.submit(SendMessageRequest{Recipient: "447700900000", MediaPath: "/tmp/upload"}, func() {
 		mu.Lock()
 		order = append(order, "cleanup")
 		mu.Unlock()
@@ -118,7 +118,7 @@ func TestFullQueueRefusesAndLeavesCleanupToTheCaller(t *testing.T) {
 	accepted := 0
 	var refusedCleanup bool
 	for i := 0; i < 10; i++ {
-		if _, ok := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {}); ok {
+		if _, _, ok := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {}); ok {
 			accepted++
 		} else {
 			refusedCleanup = true
@@ -142,7 +142,7 @@ func TestResultIsReadableByID(t *testing.T) {
 		<-release
 		return true, "Message sent to 447700900000"
 	})
-	job, _ := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
+	job, _, _ := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
 
 	res, ok := q.result(job.id)
 	if !ok || res.State != sendQueued {
@@ -175,7 +175,7 @@ func TestResultsAreBounded(t *testing.T) {
 	q := newTestQueue(t, func(context.Context, SendMessageRequest) (bool, string) { return true, "sent" })
 	var last *sendJob
 	for i := 0; i < resultsKept+50; i++ {
-		job, ok := q.submit(SendMessageRequest{Recipient: fmt.Sprint(i)}, func() {})
+		job, _, ok := q.submit(SendMessageRequest{Recipient: fmt.Sprint(i)}, func() {})
 		if !ok {
 			t.Fatalf("submit %d refused", i)
 		}
@@ -206,8 +206,8 @@ func TestShutdownWhileHeldByTheRateLimitFailsTheJob(t *testing.T) {
 	go q.run(ctx)
 
 	// The first job is due immediately; the second is held for an hour.
-	first, _ := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
-	held, _ := q.submit(SendMessageRequest{Recipient: "447700900001"}, func() {})
+	first, _, _ := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
+	held, _, _ := q.submit(SendMessageRequest{Recipient: "447700900001"}, func() {})
 	waitFor(t, first.done)
 	cancel()
 
@@ -230,7 +230,7 @@ func TestFastSendKeepsItsOutcomeNotQueued(t *testing.T) {
 		return true, "sent"
 	})
 	for i := 0; i < 200; i++ {
-		job, ok := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
+		job, _, ok := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() {})
 		if !ok {
 			t.Fatalf("submit %d refused", i)
 		}
@@ -248,11 +248,11 @@ func TestRefusedSubmissionLeavesNoTrace(t *testing.T) {
 		return true, "sent"
 	})
 	// No worker: the buffer fills and stays full.
-	if _, ok := q.submit(SendMessageRequest{Recipient: "1"}, func() {}); !ok {
+	if _, _, ok := q.submit(SendMessageRequest{Recipient: "1"}, func() {}); !ok {
 		t.Fatal("first submit refused")
 	}
 	before := q.pending()
-	if _, ok := q.submit(SendMessageRequest{Recipient: "2"}, func() {}); ok {
+	if _, _, ok := q.submit(SendMessageRequest{Recipient: "2"}, func() {}); ok {
 		t.Fatal("submit accepted past the queue depth")
 	}
 	if got := q.pending(); got != before {
@@ -263,5 +263,48 @@ func TestRefusedSubmissionLeavesNoTrace(t *testing.T) {
 	q.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("%d results recorded, want only the accepted one", n)
+	}
+}
+
+func TestShutdownFailsEverythingStillWaiting(t *testing.T) {
+	t.Setenv("WHATSAPP_SEND_MAX_QUEUE_DEPTH", "10")
+	block := make(chan struct{})
+	q := newSendQueue(newTestGate(0), func(context.Context, SendMessageRequest) (bool, string) {
+		<-block
+		return true, "sent"
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	go q.run(ctx)
+
+	var jobs []*sendJob
+	cleaned := make(chan string, 10)
+	for i := 0; i < 5; i++ {
+		job, _, ok := q.submit(SendMessageRequest{Recipient: "447700900000"}, func() { cleaned <- "x" })
+		if !ok {
+			t.Fatalf("submit %d refused", i)
+		}
+		jobs = append(jobs, job)
+	}
+
+	cancel()
+	close(block)
+
+	// Nothing may be left holding a caller or silently dropped: every job ends
+	// with a result, and every upload is cleaned up.
+	for i, job := range jobs {
+		res := waitFor(t, job.done)
+		if res.State == sendQueued {
+			t.Fatalf("job %d still reads as queued after shutdown", i)
+		}
+		if stored, _ := q.result(job.id); stored.State == sendQueued {
+			t.Fatalf("job %d left recorded as queued; a client would wait forever", i)
+		}
+	}
+	for range jobs {
+		select {
+		case <-cleaned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("an upload was never cleaned up at shutdown")
+		}
 	}
 }

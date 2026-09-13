@@ -129,6 +129,18 @@ queued and still goes out.
 Once `WHATSAPP_SEND_MAX_QUEUE_DEPTH` submissions are outstanding, further ones
 are refused with `503` rather than queued behind an hour of backlog.
 
+⚠️ **The queue is in memory.** A restart or redeploy fails everything still
+waiting, naming each one in the log, and the `id`s of earlier sends are gone
+with it. Since a queued message can sit for minutes, a deploy mid-queue does
+lose messages — deliberately, because a message sent an hour late is usually
+worse than one not sent, but it is worth knowing before batching anything
+important.
+
+⚠️ **This changed the default.** Before, `POST /api/send` sent synchronously and
+its `success` was the send's own. It now reports only that the message was
+accepted; the send can still fail afterwards, and `GET /api/send/{id}` is how
+you find out. Pass `block: true` for the old behaviour.
+
 This exists because WhatsApp unlinked a bridge's device mid-way through a burst
 of rapid first-contact messages: to their heuristics, a linked device sending
 back-to-back is a spammer.

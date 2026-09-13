@@ -964,82 +964,9 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 		})
 	})
 
-	// Handler for sending messages
-	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !requireReady(client, w) {
-			return
-		}
-
-		req, cleanup, err := parseSendRequest(r, messageStore.StoreDir)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		defer cleanup()
-
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		if logBodies {
-			fmt.Println("Received request to send message", req.Message, req.MediaPath)
-		} else {
-			fmt.Println("Received request to send message to", req.Recipient)
-		}
-
-		// The queue owns the job from here: it outlives this request, so the
-		// uploaded temp file must not be removed when the handler returns.
-		job, queued := queue.submit(req, cleanup)
-		if !queued {
-			cleanup()
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(SendMessageResponse{
-				Success: false,
-				Message: "Send queue is full; the rate limit is still working through the backlog",
-			})
-			return
-		}
-		cleanup = func() {} // the job runs it after the send
-
-		w.Header().Set("Content-Type", "application/json")
-		if !req.Block {
-			w.WriteHeader(http.StatusAccepted)
-			json.NewEncoder(w).Encode(SendMessageResponse{
-				Success: true,
-				Queued:  true,
-				ID:      job.id,
-				Message: fmt.Sprintf("Queued as %s, %d ahead of it", job.id, queue.pending()-1),
-			})
-			return
-		}
-
-		select {
-		case res := <-job.done:
-			if !res.Success {
-				w.WriteHeader(http.StatusInternalServerError)
-			}
-			json.NewEncoder(w).Encode(SendMessageResponse{
-				Success: res.Success,
-				Message: res.Message,
-				ID:      res.ID,
-			})
-		case <-r.Context().Done():
-			// The caller gave up waiting; the message is still queued and will
-			// go out, so this is not a failure to send.
-			fmt.Printf("Caller stopped waiting for %s; it stays queued\n", job.id)
-		}
-	})
+	mux.HandleFunc("/api/send", sendHandler(queue, messageStore.StoreDir, func(w http.ResponseWriter) bool {
+		return requireReady(client, w)
+	}, logBodies))
 
 	// Handler for the outcome of a submission
 	mux.HandleFunc("/api/send/", func(w http.ResponseWriter, r *http.Request) {
@@ -1047,8 +974,10 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		id := strings.TrimPrefix(r.URL.Path, "/api/send/")
-		res, ok := queue.result(id)
+		if !requireReady(client, w) {
+			return
+		}
+		res, ok := queue.result(strings.TrimPrefix(r.URL.Path, "/api/send/"))
 		w.Header().Set("Content-Type", "application/json")
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -1394,7 +1323,13 @@ func main() {
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(ctx, client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
+	// The queue holds messages for minutes, so its context must actually be
+	// cancelled on the way out: that is what lets it fail and name whatever is
+	// still waiting, instead of the process exiting over the top of it.
+	queueCtx, stopQueue := context.WithCancel(ctx)
+	defer stopQueue()
+
+	server := startRESTServer(queueCtx, client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {
@@ -1457,7 +1392,7 @@ func main() {
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
-	// Disconnect client
+	stopQueue()
 	client.Disconnect()
 }
 

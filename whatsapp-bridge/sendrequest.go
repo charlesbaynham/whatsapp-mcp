@@ -39,19 +39,11 @@ func parseSendRequest(r *http.Request, storeDir string) (SendMessageRequest, fun
 		Message:   r.FormValue("message"),
 		MediaPath: r.FormValue("media_path"),
 	}
-	for _, f := range []struct {
-		name string
-		dest *bool
-	}{{"voice_note", &req.VoiceNote}, {"block", &req.Block}} {
-		v := r.FormValue(f.name)
-		if v == "" {
-			continue
-		}
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return req, noop, fmt.Errorf("%s must be true or false", f.name)
-		}
-		*f.dest = b
+	if err := formBool(r, "voice_note", &req.VoiceNote); err != nil {
+		return req, noop, err
+	}
+	if err := formBool(r, "block", &req.Block); err != nil {
+		return req, noop, err
 	}
 
 	file, header, err := r.FormFile("file")
@@ -86,4 +78,18 @@ func parseSendRequest(r *http.Request, storeDir string) (SendMessageRequest, fun
 	// A document is titled by its filename; the temp name would leak otherwise.
 	req.uploadName = name
 	return req, func() { os.Remove(tmp.Name()) }, nil
+}
+
+// formBool reads an optional boolean form field, leaving dest alone if absent.
+func formBool(r *http.Request, name string, dest *bool) error {
+	v := r.FormValue(name)
+	if v == "" {
+		return nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("%s must be true or false", name)
+	}
+	*dest = b
+	return nil
 }

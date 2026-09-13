@@ -12,13 +12,10 @@ import (
 const (
 	defaultQueueDepth = 100
 
-	// The worker owns the send, so it cannot inherit an HTTP request's context:
-	// that one is cancelled the moment the handler returns, which for an async
-	// submission is before the message has gone anywhere.
+	// Never r.Context(): that is cancelled when the handler returns, which for
+	// an async submission is before the message has gone anywhere.
 	sendTimeout = 5 * time.Minute
 
-	// Results are kept only so a client can ask how its submission went; the
-	// message store is the durable record.
 	resultsKept = 500
 )
 
@@ -37,7 +34,7 @@ type SendResult struct {
 	Success  bool      `json:"success"`
 	Message  string    `json:"message"`
 	QueuedAt time.Time `json:"queued_at"`
-	SentAt   time.Time `json:"sent_at,omitempty"`
+	SentAt   time.Time `json:"sent_at,omitzero"`
 }
 
 type sendJob struct {
@@ -62,7 +59,9 @@ type sendQueue struct {
 }
 
 func newSendQueue(gate *sendGate, send func(context.Context, SendMessageRequest) (bool, string)) *sendQueue {
-	depth := envPositiveInt("WHATSAPP_SEND_MAX_QUEUE_DEPTH", defaultQueueDepth)
+	// A backlog deeper than the results kept would evict a record while its
+	// message is still waiting, so /api/send/{id} would 404 on a live send.
+	depth := min(envPositiveInt("WHATSAPP_SEND_MAX_QUEUE_DEPTH", defaultQueueDepth), resultsKept)
 	return &sendQueue{
 		jobs:    make(chan *sendJob, depth),
 		gate:    gate,
@@ -77,6 +76,7 @@ func (q *sendQueue) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			q.drain()
 			return
 		case job := <-q.jobs:
 			q.dispatch(ctx, job)
@@ -87,13 +87,18 @@ func (q *sendQueue) run(ctx context.Context) {
 func (q *sendQueue) dispatch(ctx context.Context, job *sendJob) {
 	defer job.cleanup()
 
+	if ctx.Err() != nil {
+		q.abandon(job)
+		return
+	}
+
 	if wait := time.Until(q.gate.due(time.Now())); wait > 0 {
 		fmt.Printf("Holding send %s for %s (rate limit)\n", job.id, wait.Round(time.Second))
 		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			q.finish(job, false, "bridge shutting down before the send left the queue")
+			q.abandon(job)
 			return
 		case <-t.C:
 		}
@@ -106,9 +111,30 @@ func (q *sendQueue) dispatch(ctx context.Context, job *sendJob) {
 	q.finish(job, success, message)
 }
 
-// submit queues a job, returning its result channel. ok is false when the queue
-// is full, in which case nothing is queued and the caller still owns cleanup.
-func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob, ok bool) {
+// drain fails everything still waiting when the bridge stops. Nothing here has
+// been sent, and the queue is memory-only, so each one has to be named in the
+// log: the alternative is a message that silently never went out.
+func (q *sendQueue) drain() {
+	for {
+		select {
+		case job := <-q.jobs:
+			job.cleanup()
+			q.abandon(job)
+		default:
+			return
+		}
+	}
+}
+
+func (q *sendQueue) abandon(job *sendJob) {
+	fmt.Printf("Send %s to %s abandoned: bridge stopped before it left the queue\n", job.id, job.req.Recipient)
+	q.finish(job, false, "bridge stopped before the send left the queue")
+}
+
+// submit queues a job, returning it and how many sends are ahead of it. ok is
+// false when the queue is full, in which case nothing is queued and the caller
+// still owns cleanup.
+func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob, ahead int, ok bool) {
 	job = &sendJob{id: newSendID(), req: req, cleanup: cleanup, done: make(chan SendResult, 1)}
 
 	// Book the job in before handing it to the worker: a send can complete
@@ -116,15 +142,16 @@ func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob
 	// this one's "queued".
 	q.mu.Lock()
 	q.depth++
+	ahead = q.depth - 1
 	q.mu.Unlock()
 	q.record(SendResult{ID: job.id, State: sendQueued, QueuedAt: time.Now()})
 
 	select {
 	case q.jobs <- job:
-		return job, true
+		return job, ahead, true
 	default:
 		q.forget(job.id)
-		return nil, false
+		return nil, 0, false
 	}
 }
 

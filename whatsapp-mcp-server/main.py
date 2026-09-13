@@ -301,7 +301,8 @@ def send_file(recipient: str, media_path: str, block: bool = False) -> Dict[str,
                  outcome must be known before doing anything else.
 
     Returns:
-        A dictionary containing success status and a status message
+        A dictionary containing success status, a status message, and the
+        submission id
     """
     if not recipient or not media_path:
         return {"success": False, "message": "recipient and media_path must be provided"}
@@ -329,7 +330,8 @@ def send_audio_message(recipient: str, media_path: str, block: bool = False) -> 
                  outcome must be known before doing anything else.
 
     Returns:
-        A dictionary containing success status and a status message
+        A dictionary containing success status, a status message, and the
+        submission id
     """
     if not recipient or not media_path:
         return {"success": False, "message": "recipient and media_path must be provided"}
