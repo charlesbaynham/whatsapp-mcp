@@ -331,6 +331,10 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// ID identifies the submission at GET /api/send/{id}. Queued is true when
+	// the message was accepted but not yet sent, which is the default.
+	ID     string `json:"id,omitempty"`
+	Queued bool   `json:"queued,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -341,6 +345,9 @@ type SendMessageRequest struct {
 	// VoiceNote sends the media as a playable WhatsApp voice message,
 	// transcoding it to Ogg Opus with ffmpeg first if it isn't one already.
 	VoiceNote bool `json:"voice_note,omitempty"`
+	// Block waits for the message to actually go out rather than returning as
+	// soon as it is queued. The wait is the rate limit's, so it can be minutes.
+	Block bool `json:"block,omitempty"`
 	// uploadName is the original filename of a multipart upload, used as the
 	// document title instead of the temp file's name.
 	uploadName string
@@ -929,9 +936,14 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 	dispatcher := pub.dispatcher
+
+	queue := newSendQueue(newSendGateFromEnv(), func(ctx context.Context, req SendMessageRequest) (bool, string) {
+		return sendWhatsAppMedia(ctx, client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
+	})
+	go queue.run(queueCtx)
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
 	registerReadRoutes(mux, messageStore)
@@ -952,50 +964,27 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, pub *
 		})
 	})
 
-	// Handler for sending messages
-	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+	mux.HandleFunc("/api/send", sendHandler(queue, messageStore.StoreDir, func(w http.ResponseWriter) bool {
+		return requireReady(client, w)
+	}, logBodies))
+
+	// Handler for the outcome of a submission
+	mux.HandleFunc("/api/send/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if !requireReady(client, w) {
 			return
 		}
-
-		req, cleanup, err := parseSendRequest(r, messageStore.StoreDir)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		defer cleanup()
-
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		if logBodies {
-			fmt.Println("Received request to send message", req.Message, req.MediaPath)
-		} else {
-			fmt.Println("Received request to send message to", req.Recipient)
-		}
-
-		success, message := sendWhatsAppMedia(r.Context(), client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
-		fmt.Println("Message sent", success, message)
-
+		res, ok := queue.result(strings.TrimPrefix(r.URL.Path, "/api/send/"))
 		w.Header().Set("Content-Type", "application/json")
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no such send id"})
+			return
 		}
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
+		json.NewEncoder(w).Encode(res)
 	})
 
 	// Handler for downloading media
@@ -1334,7 +1323,13 @@ func main() {
 
 	// The REST server (and /api/status in particular) must be answerable
 	// before pairing completes, so start it before the QR/connect phase.
-	server := startRESTServer(client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
+	// The queue holds messages for minutes, so its context must actually be
+	// cancelled on the way out: that is what lets it fail and name whatever is
+	// still waiting, instead of the process exiting over the top of it.
+	queueCtx, stopQueue := context.WithCancel(ctx)
+	defer stopQueue()
+
+	server := startRESTServer(queueCtx, client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {
@@ -1397,7 +1392,7 @@ func main() {
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
-	// Disconnect client
+	stopQueue()
 	client.Disconnect()
 }
 

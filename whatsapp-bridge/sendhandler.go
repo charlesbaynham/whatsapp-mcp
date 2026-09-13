@@ -1,0 +1,86 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+)
+
+// sendHandler accepts a message and hands it to the queue. ready reports
+// whether WhatsApp is connected, injected so the handler is testable without a
+// live client.
+func sendHandler(queue *sendQueue, storeDir string, ready func(http.ResponseWriter) bool, logBodies bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !ready(w) {
+			return
+		}
+
+		req, cleanup, err := parseSendRequest(r, storeDir)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// `defer cleanup()` would bind the closure parseSendRequest returned,
+		// and go on deleting the upload even after the queue takes ownership of
+		// it below — for an async send, before the worker has read the file.
+		defer func() { cleanup() }()
+
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+		if req.Message == "" && req.MediaPath == "" {
+			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+			return
+		}
+
+		if logBodies {
+			fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		} else {
+			fmt.Println("Received request to send message to", req.Recipient)
+		}
+
+		job, ahead, queued := queue.submit(req, cleanup)
+		if !queued {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "Send queue is full; the rate limit is still working through the backlog",
+			})
+			return
+		}
+		cleanup = func() {} // the job owns the upload now and cleans up after sending
+
+		w.Header().Set("Content-Type", "application/json")
+		if !req.Block {
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: true,
+				Queued:  true,
+				ID:      job.id,
+				Message: fmt.Sprintf("Queued as %s, %d ahead of it", job.id, ahead),
+			})
+			return
+		}
+
+		select {
+		case res := <-job.done:
+			if !res.Success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: res.Success,
+				Message: res.Message,
+				ID:      res.ID,
+			})
+		case <-r.Context().Done():
+			// The caller gave up; the job stays queued and still goes out.
+			fmt.Printf("Caller stopped waiting for %s\n", job.id)
+		}
+	}
+}

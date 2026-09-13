@@ -21,6 +21,13 @@ UNIX_PLACEHOLDER_HOST = "http://whatsapp"
 
 REQUEST_TIMEOUT = 30.0
 MEDIA_TIMEOUT = 120.0
+# A send returns as soon as the bridge has queued it, so the ordinary timeout is
+# plenty. block=True instead waits for the message to leave, which the rate limit
+# can hold for minutes — hence a timeout long enough to be worth the wait. Giving
+# up early loses only the outcome: the message stays queued and still goes out.
+BLOCKING_SEND_TIMEOUT = 900.0
+# A queued send answers 202, a blocking one 200.
+SEND_OK = (200, 202)
 
 
 class BridgeError(Exception):
@@ -223,8 +230,25 @@ class WhatsAppClient:
 
     # --- sending ---
 
-    def send_message(self, recipient: str, message: str) -> Dict[str, Any]:
-        return self._json("POST", "/send", json={"recipient": recipient, "message": message})
+    def send_message(self, recipient: str, message: str, *, block: bool = False) -> Dict[str, Any]:
+        """Queue a message. Returns `{success, queued, id}` once accepted.
+
+        ``block=True`` waits for it to actually leave and returns the send's own
+        outcome instead. Either way the id can be passed to `send_status`.
+        """
+        return self._json("POST", "/send", timeout=self._send_timeout(block), ok=SEND_OK,
+                          json={"recipient": recipient, "message": message, "block": block})
+
+    def send_status(self, send_id: str) -> Dict[str, Any]:
+        """Look up a queued send: `{id, state, success, message, ...}`.
+
+        ``state`` is queued, sent or failed. Only recent sends are kept.
+        """
+        return self._json("GET", f"/send/{send_id}")
+
+    @staticmethod
+    def _send_timeout(block: bool) -> float:
+        return BLOCKING_SEND_TIMEOUT if block else REQUEST_TIMEOUT
 
     def send_file(
         self,
@@ -235,6 +259,7 @@ class WhatsAppClient:
         filename: Optional[str] = None,
         caption: str = "",
         voice_note: bool = False,
+        block: bool = False,
     ) -> Dict[str, Any]:
         """Send an attachment.
 
@@ -245,17 +270,24 @@ class WhatsAppClient:
         """
         if data is None and path is None:
             raise ValueError("send_file needs path or data")
-        fields = {"recipient": recipient, "message": caption, "voice_note": "true" if voice_note else "false"}
+        fields = {
+            "recipient": recipient,
+            "message": caption,
+            "voice_note": "true" if voice_note else "false",
+            "block": "true" if block else "false",
+        }
+        timeout = self._send_timeout(block)
         if data is not None:
             files = {"file": (filename or "upload", data)}
-            return self._json("POST", "/send", data=fields, files=files, timeout=MEDIA_TIMEOUT)
+            return self._json("POST", "/send", data=fields, files=files, timeout=timeout, ok=SEND_OK)
         assert path is not None
         if os.path.isfile(path) and os.access(path, os.R_OK):
             with open(path, "rb") as fh:
                 files = {"file": (filename or os.path.basename(path), fh)}
-                return self._json("POST", "/send", data=fields, files=files, timeout=MEDIA_TIMEOUT)
-        return self._json("POST", "/send", timeout=MEDIA_TIMEOUT, json={
-            "recipient": recipient, "message": caption, "media_path": path, "voice_note": voice_note})
+                return self._json("POST", "/send", data=fields, files=files, timeout=timeout, ok=SEND_OK)
+        return self._json("POST", "/send", timeout=timeout, ok=SEND_OK, json={
+            "recipient": recipient, "message": caption, "media_path": path,
+            "voice_note": voice_note, "block": block})
 
     # --- media ---
 

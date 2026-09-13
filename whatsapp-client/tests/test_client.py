@@ -5,7 +5,7 @@ import unittest
 import httpx
 
 from whatsapp_client import BridgeError, BridgeUnavailable, WhatsAppClient, parse_bridge_url
-from whatsapp_client.client import _parse_sse
+from whatsapp_client.client import REQUEST_TIMEOUT, _parse_sse
 
 
 class ParseBridgeURLTests(unittest.TestCase):
@@ -70,7 +70,8 @@ class RequestShapeTests(unittest.TestCase):
         client, rec = make_client(lambda r: httpx.Response(200, json={"success": True, "message": "ok"}))
         out = client.send_message("447700900000", "hello")
         self.assertEqual(out["success"], True)
-        self.assertEqual(json.loads(rec.requests[0].content), {"recipient": "447700900000", "message": "hello"})
+        self.assertEqual(json.loads(rec.requests[0].content),
+                         {"recipient": "447700900000", "message": "hello", "block": False})
 
     def test_send_file_uploads_data_as_multipart(self):
         client, rec = make_client(lambda r: httpx.Response(200, json={"success": True, "message": "ok"}))
@@ -87,7 +88,8 @@ class RequestShapeTests(unittest.TestCase):
         client, rec = make_client(lambda r: httpx.Response(200, json={"success": True, "message": "ok"}))
         client.send_file("1", path="/data/store/x/does-not-exist.jpg")
         self.assertEqual(json.loads(rec.requests[0].content), {
-            "recipient": "1", "message": "", "media_path": "/data/store/x/does-not-exist.jpg", "voice_note": False})
+            "recipient": "1", "message": "", "media_path": "/data/store/x/does-not-exist.jpg",
+            "voice_note": False, "block": False})
 
     def test_webhook_crud_status_codes(self):
         client, rec = make_client(lambda r: httpx.Response(201 if r.method == "POST" else 204, json={"id": 1}))
@@ -146,3 +148,34 @@ class EventsStreamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SendQueueTests(unittest.TestCase):
+    def test_send_defaults_to_queueing(self):
+        client, rec = make_client(lambda r: httpx.Response(
+            202, json={"success": True, "queued": True, "id": "snd-1", "message": "Queued as snd-1"}))
+        out = client.send_message("447700900000", "hello")
+        self.assertEqual(out["id"], "snd-1")
+        self.assertTrue(out["queued"])
+        self.assertIs(json.loads(rec.requests[0].content)["block"], False)
+
+    def test_block_is_sent_and_waits_longer(self):
+        client, rec = make_client(lambda r: httpx.Response(
+            200, json={"success": True, "message": "Message sent", "id": "snd-1"}))
+        out = client.send_message("447700900000", "hello", block=True)
+        self.assertNotIn("queued", out)
+        self.assertIs(json.loads(rec.requests[0].content)["block"], True)
+        # Blocking waits out the rate limit, so it must not use the short timeout.
+        self.assertGreater(rec.requests[0].extensions["timeout"]["read"], REQUEST_TIMEOUT)
+
+    def test_send_file_passes_block_through(self):
+        client, rec = make_client(lambda r: httpx.Response(200, json={"success": True, "message": "ok"}))
+        client.send_file("1", path="/data/store/x/missing.jpg", block=True)
+        self.assertIs(json.loads(rec.requests[0].content)["block"], True)
+
+    def test_send_status_reads_the_outcome(self):
+        client, rec = make_client(lambda r: httpx.Response(
+            200, json={"id": "snd-1", "state": "failed", "success": False, "message": "no LID found"}))
+        out = client.send_status("snd-1")
+        self.assertEqual(rec.requests[0].url.path, "/api/send/snd-1")
+        self.assertEqual(out["state"], "failed")

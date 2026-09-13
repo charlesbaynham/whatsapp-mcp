@@ -30,7 +30,27 @@ class ErrorFoldingTests(unittest.TestCase):
     def test_send_audio_sets_voice_note(self):
         with mock.patch.object(main.wa, "send_file", return_value={"success": True, "message": "ok"}) as sf:
             main.send_audio_message("1", "/tmp/x.mp3")
-        sf.assert_called_once_with("1", path="/tmp/x.mp3", voice_note=True)
+        sf.assert_called_once_with("1", path="/tmp/x.mp3", voice_note=True, block=False)
+
+    def test_sends_queue_by_default(self):
+        with mock.patch.object(main.wa, "send_message", return_value={"success": True, "queued": True}) as sm:
+            main.send_message("1", "hi")
+        sm.assert_called_once_with("1", "hi", block=False)
+        with mock.patch.object(main.wa, "send_file", return_value={"success": True, "message": "ok"}) as sf:
+            main.send_file("1", "/tmp/x.jpg")
+        sf.assert_called_once_with("1", path="/tmp/x.jpg", block=False)
+
+    def test_block_reaches_the_bridge(self):
+        with mock.patch.object(main.wa, "send_message", return_value={"success": True, "message": "sent"}) as sm:
+            main.send_message("1", "hi", block=True)
+        sm.assert_called_once_with("1", "hi", block=True)
+
+    def test_get_send_status_folds_errors(self):
+        with mock.patch.object(main.wa, "send_status", return_value={"id": "snd-1", "state": "sent"}):
+            self.assertEqual(main.get_send_status("snd-1")["state"], "sent")
+        with mock.patch.object(main.wa, "send_status", side_effect=BridgeError("nf", status=404)):
+            self.assertFalse(main.get_send_status("snd-1")["success"])
+        self.assertFalse(main.get_send_status("")["success"])
 
 
 class ReshapeTests(unittest.TestCase):
