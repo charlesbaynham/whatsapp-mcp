@@ -23,3 +23,7 @@ message — sends are rate limited and go out a randomised delay later. The
 returned `id` reads back through `send_status(id)` (`queued`, `sent`, `failed`).
 Pass `block=True` to wait for the send itself instead; that can take minutes,
 and giving up on the wait loses only the outcome, not the message.
+
+A **first contact** — someone the bridge has never had a chat with — is held
+much longer, in a separate queue spaced about 30 minutes apart on average; the
+reply then has `new_contact: True` and an `estimated_wait_seconds`.

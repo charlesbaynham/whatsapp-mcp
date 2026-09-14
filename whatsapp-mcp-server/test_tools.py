@@ -135,3 +135,56 @@ class BatchSendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NewContactWarningTests(unittest.TestCase):
+    """A first contact is held far longer than usual; the agent is told so."""
+
+    def test_single_send_to_a_first_contact_warns(self):
+        reply = {"success": True, "queued": True, "id": "snd-1", "new_contact": True,
+                 "ahead": 2, "estimated_wait_seconds": 3600}
+        with mock.patch.object(main.wa, "send_message", return_value=reply):
+            out = main.send_message("447700900000", "hi")
+        self.assertTrue(out["new_contact"])
+        self.assertIn("never been messaged", out["warning"])
+        self.assertIn("about 1.0 h", out["warning"])
+        self.assertIn("Tell the user", out["warning"])
+
+    def test_ordinary_send_has_no_warning(self):
+        with mock.patch.object(main.wa, "send_message", return_value={"success": True, "queued": True, "id": "snd-1"}):
+            out = main.send_message("447700900000", "hi")
+        self.assertNotIn("warning", out)
+
+    def test_media_sends_warn_too(self):
+        reply = {"success": True, "queued": True, "id": "snd-1", "new_contact": True, "estimated_wait_seconds": 90}
+        with mock.patch.object(main.wa, "send_file", return_value=reply):
+            self.assertIn("about 2 min", main.send_file("1", "/tmp/x.jpg")["warning"])
+            self.assertIn("warning", main.send_audio_message("1", "/tmp/x.ogg"))
+
+    def test_batch_counts_first_contacts_and_estimates_completion(self):
+        replies = [{"success": True, "queued": True, "id": "snd-1", "estimated_wait_seconds": 30},
+                   {"success": True, "queued": True, "id": "snd-2", "new_contact": True,
+                    "ahead": 0, "estimated_wait_seconds": 60},
+                   {"success": True, "queued": True, "id": "snd-3", "new_contact": True,
+                    "ahead": 1, "estimated_wait_seconds": 1860}]
+        with mock.patch.object(main.wa, "send_message", side_effect=replies):
+            out = main.send_messages([{"recipient": "1", "message": "a"},
+                                      {"recipient": "2", "message": "b"},
+                                      {"recipient": "3", "message": "c"}])
+        self.assertTrue(out["success"])
+        self.assertEqual(out["new_contacts"], 2)
+        self.assertEqual(out["estimated_completion_seconds"], 1860)
+        self.assertIn("2 of the 3 queued", out["warning"])
+        self.assertIn("about 31 min", out["warning"])
+        self.assertNotIn("new_contact", out["results"][0])
+        self.assertTrue(out["results"][2]["new_contact"])
+        self.assertEqual(out["results"][2]["estimated_wait_seconds"], 1860)
+
+    def test_batch_of_established_chats_has_no_warning(self):
+        replies = [{"success": True, "queued": True, "id": "snd-1", "estimated_wait_seconds": 0},
+                   {"success": True, "queued": True, "id": "snd-2", "ahead": 1, "estimated_wait_seconds": 30}]
+        with mock.patch.object(main.wa, "send_message", side_effect=replies):
+            out = main.send_messages([{"recipient": "1", "message": "a"}, {"recipient": "1", "message": "b"}])
+        self.assertEqual(out["new_contacts"], 0)
+        self.assertEqual(out["estimated_completion_seconds"], 30)
+        self.assertNotIn("warning", out)

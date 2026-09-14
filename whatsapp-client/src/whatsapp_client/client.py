@@ -240,7 +240,10 @@ class WhatsAppClient:
     # --- sending ---
 
     def send_message(self, recipient: str, message: str, *, block: bool = False) -> Dict[str, Any]:
-        """Queue a message. Returns `{success, queued, id}` once accepted.
+        """Queue a message. Returns `{success, queued, id, ahead,
+        estimated_wait_seconds}` once accepted, plus ``new_contact: True`` for a
+        recipient the bridge has never had a chat with — those are held in a
+        separate, much more slowly drained queue first.
 
         ``block=True`` waits for it to actually leave and returns the send's own
         outcome instead. Either way the id can be passed to `send_status`.

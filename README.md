@@ -103,6 +103,7 @@ own user, admitted to the socket by group membership and nothing else.
 | `WHATSAPP_BRIDGE_SOCKET_GROUP` | unset | With a Unix socket, chgrp it to this group so clients are admitted by membership |
 | `WHATSAPP_LOG_MESSAGE_BODIES` | unset | Set to `1` to log message content to stdout; by default only metadata (timestamp, direction, chat, media type) is logged |
 | `WHATSAPP_SEND_GAP_MEAN_SECONDS` | `30` | Mean gap the outbound rate limit holds between sends, drawn Exponential per message. `0` disables the limit |
+| `WHATSAPP_NEW_CONTACT_GAP_MEAN_SECONDS` | `1800` | Mean gap between sends to *new contacts* (people never messaged from this account), drawn Exponential per contact, floor 60 s. `0` disables the separate new-contact queue |
 | `WHATSAPP_SEND_MAX_QUEUE_DEPTH` | `100` | Submissions accepted before the queue is full and further ones are refused |
 | `WHATSAPP_TRANSCRIBE` | unset | Set to `1` to transcribe incoming voice notes locally with whisper.cpp |
 | `WHATSAPP_WHISPER_MODEL` | `<store>/models/ggml-base.bin` | whisper.cpp model file; downloaded on first use if missing |
@@ -128,6 +129,39 @@ queued and still goes out.
 
 Once `WHATSAPP_SEND_MAX_QUEUE_DEPTH` submissions are outstanding, further ones
 are refused with `503` rather than queued behind an hour of backlog.
+
+#### New contacts are spaced much more widely
+
+The spacing above keeps messages from bunching. It does nothing about the
+signal WhatsApp's spam heuristics weight most heavily: an account **starting
+conversations with a run of people it has never messaged**, typically with the
+same text — which is exactly what happens when a note goes out to everyone in a
+group. Messaging strangers is treated very differently from replying in
+existing chats (see [this summary of WhatsApp's 2026 detection
+signals](https://achiya-automation.com/en/blog/whatsapp-spam-detection-2026/)),
+and it is what earns the reach-out time-lock or an unlinked device.
+
+So a send to a **new contact** — a person (phone number or LID, never a group)
+with whom the bridge has no chat at all — does not join the main queue directly.
+It waits in a separate new-contact queue, which releases one contact at a time
+into the main queue spaced by its own exponential gap (mean
+`WHATSAPP_NEW_CONTACT_GAP_MEAN_SECONDS`, default 30 min, floor 1 min). Once on
+the main queue it is spaced by the ordinary gate like everything else. Ten
+messages to ten strangers therefore take about five hours to go out, not five
+minutes; a message into an existing chat is never delayed by any of this.
+
+Only the *first* message to a contact pays the wait. Further messages to the
+same person submitted while it is held queue behind it in the new-contact queue
+and leave with it, so a two-message opener still counts as one new contact;
+once someone has been released (or, after a restart, once a chat with them
+exists) they are an ordinary recipient. If WhatsApp's reach-out time-lock is
+active, releases also wait for it to end rather than going out to fail.
+
+The `202` for such a send says so — `new_contact: true`, the number of new
+contacts `ahead` of it and a rough `estimated_wait_seconds` — and `GET
+/api/send/{id}` carries `new_contact` too. `GET /api/status` reports
+`send_queue: {pending, new_contacts_held}`. The MCP tools pass this on as a
+`warning` telling the agent to let the user know the message will go out later.
 
 The `send_messages` MCP tool submits a whole batch this way: one tool call, one
 approval, N messages onto the same queue in the order given, each still spaced
@@ -228,7 +262,7 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
-- **send_messages**: Queue several messages in one call — same queue, same spacing, one approval
+- **send_messages**: Queue several messages in one call — same queue, same spacing, one approval; reports how many are new contacts and when the last is expected to leave
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path

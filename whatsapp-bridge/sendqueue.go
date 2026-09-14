@@ -29,12 +29,16 @@ const (
 
 // SendResult is the outcome of one submission, readable at GET /api/send/{id}.
 type SendResult struct {
-	ID       string    `json:"id"`
-	State    sendState `json:"state"`
-	Success  bool      `json:"success"`
-	Message  string    `json:"message"`
-	QueuedAt time.Time `json:"queued_at"`
-	SentAt   time.Time `json:"sent_at,omitzero"`
+	ID      string    `json:"id"`
+	State   sendState `json:"state"`
+	Success bool      `json:"success"`
+	Message string    `json:"message"`
+	// NewContact marks a send to someone this account has never messaged: it
+	// waits in the new-contact stage before it is even on the main queue, so
+	// "queued" can mean a good deal longer than usual.
+	NewContact bool      `json:"new_contact,omitempty"`
+	QueuedAt   time.Time `json:"queued_at"`
+	SentAt     time.Time `json:"sent_at,omitzero"`
 }
 
 type sendJob struct {
@@ -47,32 +51,49 @@ type sendJob struct {
 // sendQueue serialises outbound sends through one worker, spacing them with the
 // gate. Submissions are accepted and acknowledged immediately; a caller that
 // wants the outcome waits on the returned channel instead.
+//
+// A send to someone the account has never messaged does not join the main
+// queue directly: it waits in newContacts first (see newContactStage), and is
+// handed on to jobs — subject to the ordinary gate like everything else — only
+// when that stage releases it.
 type sendQueue struct {
-	jobs chan *sendJob
-	gate *sendGate
-	send func(ctx context.Context, req SendMessageRequest) (bool, string)
+	jobs        chan *sendJob
+	gate        *sendGate
+	newContacts *newContactStage // nil: first contacts are not held separately
+	send        func(ctx context.Context, req SendMessageRequest) (bool, string)
 
 	mu      sync.Mutex
 	results map[string]SendResult
 	order   []string
-	depth   int
+	depth   int // on the main queue, the in-flight send included
+	held    int // in the new-contact stage
 }
 
 func newSendQueue(gate *sendGate, send func(context.Context, SendMessageRequest) (bool, string)) *sendQueue {
-	// A backlog deeper than the results kept would evict a record while its
-	// message is still waiting, so /api/send/{id} would 404 on a live send.
-	depth := min(envPositiveInt("WHATSAPP_SEND_MAX_QUEUE_DEPTH", defaultQueueDepth), resultsKept)
 	return &sendQueue{
-		jobs:    make(chan *sendJob, depth),
+		jobs:    make(chan *sendJob, queueDepthFromEnv()),
 		gate:    gate,
 		send:    send,
 		results: make(map[string]SendResult, resultsKept),
 	}
 }
 
-// run drives the queue until ctx is cancelled. One goroutine, so sends never
-// overlap and the gate needs no lock.
+// queueDepthFromEnv is how many submissions a queue accepts before refusing
+// more. A backlog deeper than the results kept would evict a record while its
+// message is still waiting, so /api/send/{id} would 404 on a live send; the
+// main queue and the new-contact stage each hold this many, so they share
+// the results budget.
+func queueDepthFromEnv() int {
+	return min(envPositiveInt("WHATSAPP_SEND_MAX_QUEUE_DEPTH", defaultQueueDepth), resultsKept/2)
+}
+
+// run drives the queue until ctx is cancelled: one worker goroutine for the
+// main queue and one for the new-contact stage, so sends never overlap and
+// each gate is advanced from a single place.
 func (q *sendQueue) run(ctx context.Context) {
+	if q.newContacts != nil {
+		go q.newContacts.run(ctx, q)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -131,28 +152,82 @@ func (q *sendQueue) abandon(job *sendJob) {
 	q.finish(job, false, "bridge stopped before the send left the queue")
 }
 
-// submit queues a job, returning it and how many sends are ahead of it. ok is
-// false when the queue is full, in which case nothing is queued and the caller
-// still owns cleanup.
-func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob, ahead int, ok bool) {
+// queuePosition is where a submission landed and what that implies for the
+// caller: how many sends are ahead of it (on the main queue, or in the
+// new-contact stage when newContact is set, where ahead counts the other
+// first contacts still waiting there) and a rough expected wait before it
+// goes out, from the gates' means and whatever backlog and reach-out
+// time-lock are in force at submission.
+type queuePosition struct {
+	ahead      int
+	newContact bool
+	wait       time.Duration
+}
+
+// submit queues a job, returning it and its position. ok is false when the
+// queue is full, in which case nothing is queued and the caller still owns
+// cleanup.
+func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob, pos queuePosition, ok bool) {
 	job = &sendJob{id: newSendID(), req: req, cleanup: cleanup, done: make(chan SendResult, 1)}
+
+	pos.newContact = q.newContacts != nil && q.newContacts.holds(req.Recipient)
 
 	// Book the job in before handing it to the worker: a send can complete
 	// before this function returns, and its outcome must not be overwritten by
 	// this one's "queued".
 	q.mu.Lock()
-	q.depth++
-	ahead = q.depth - 1
-	q.mu.Unlock()
-	q.record(SendResult{ID: job.id, State: sendQueued, QueuedAt: time.Now()})
-
-	select {
-	case q.jobs <- job:
-		return job, ahead, true
-	default:
-		q.forget(job.id)
-		return nil, 0, false
+	if pos.newContact {
+		q.held++
+		pos.ahead = q.held - 1
+		pos.wait = q.newContacts.expectedWait(pos.ahead) + q.mainWaitLocked(q.depth)
+	} else {
+		q.depth++
+		pos.ahead = q.depth - 1
+		pos.wait = q.mainWaitLocked(pos.ahead)
 	}
+	q.mu.Unlock()
+	q.record(SendResult{ID: job.id, State: sendQueued, NewContact: pos.newContact, QueuedAt: time.Now()})
+
+	dest := q.jobs
+	if pos.newContact {
+		dest = q.newContacts.jobs
+	}
+	select {
+	case dest <- job:
+		return job, pos, true
+	default:
+		q.forget(job.id, pos.newContact)
+		return nil, queuePosition{}, false
+	}
+}
+
+// mainWaitLocked estimates how long a send behind `ahead` others on the main
+// queue waits: until the gate's next slot, then one mean gap per send ahead
+// of it. A send in flight has already used its slot, so this errs a gap long
+// while one is out. Called with q.mu held.
+func (q *sendQueue) mainWaitLocked(ahead int) time.Duration {
+	if !q.gate.enabled() {
+		return 0
+	}
+	return waitFrom(q.gate.peek()) + time.Duration(ahead)*q.gate.mean
+}
+
+// waitFrom is how far off an instant is, or zero once it has passed.
+func waitFrom(t time.Time) time.Duration {
+	if d := time.Until(t); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// promote moves a job the new-contact stage is done with onto the main
+// queue's books, before it is actually handed over, so its result and the
+// depth counts never disagree about where it is.
+func (q *sendQueue) promote(job *sendJob) {
+	q.mu.Lock()
+	q.held--
+	q.depth++
+	q.mu.Unlock()
 }
 
 func (q *sendQueue) finish(job *sendJob, success bool, message string) {
@@ -160,9 +235,10 @@ func (q *sendQueue) finish(job *sendJob, success bool, message string) {
 	if success {
 		state = sendSent
 	}
+	booked := q.booking(job.id)
 	res := SendResult{
 		ID: job.id, State: state, Success: success, Message: message,
-		QueuedAt: q.queuedAt(job.id), SentAt: time.Now(),
+		NewContact: booked.NewContact, QueuedAt: booked.QueuedAt, SentAt: time.Now(),
 	}
 	q.record(res)
 	q.mu.Lock()
@@ -171,10 +247,12 @@ func (q *sendQueue) finish(job *sendJob, success bool, message string) {
 	job.done <- res
 }
 
-func (q *sendQueue) queuedAt(id string) time.Time {
+// booking is the record made when a job was submitted; the fields that
+// describe the submission rather than its outcome carry over into the result.
+func (q *sendQueue) booking(id string) SendResult {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.results[id].QueuedAt
+	return q.results[id]
 }
 
 // record stores a result, evicting the oldest once resultsKept is reached. A
@@ -198,10 +276,14 @@ func (q *sendQueue) record(res SendResult) {
 }
 
 // forget drops a booking the queue could not accept.
-func (q *sendQueue) forget(id string) {
+func (q *sendQueue) forget(id string, newContact bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.depth--
+	if newContact {
+		q.held--
+	} else {
+		q.depth--
+	}
 	delete(q.results, id)
 	for i, known := range q.order {
 		if known == id {
@@ -218,10 +300,26 @@ func (q *sendQueue) result(id string) (SendResult, bool) {
 	return res, ok
 }
 
+// pending is how many submissions have not yet finished, wherever they are.
 func (q *sendQueue) pending() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.depth
+	return q.depth + q.held
+}
+
+// sendQueueStatus is the JSON shape exposed under send_queue in /api/status.
+type sendQueueStatus struct {
+	// Pending is the main queue's backlog, the in-flight send included.
+	Pending int `json:"pending"`
+	// NewContactsHeld is how many first-contact sends are still waiting in
+	// the new-contact stage, before they reach the main queue at all.
+	NewContactsHeld int `json:"new_contacts_held"`
+}
+
+func (q *sendQueue) status() sendQueueStatus {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return sendQueueStatus{Pending: q.depth, NewContactsHeld: q.held}
 }
 
 func newSendID() string {

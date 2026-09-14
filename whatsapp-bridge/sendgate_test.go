@@ -8,7 +8,7 @@ import (
 )
 
 func newTestGate(mean time.Duration) *sendGate {
-	return &sendGate{rand: rand.New(rand.NewSource(1)), mean: mean}
+	return &sendGate{rand: rand.New(rand.NewSource(1)), mean: mean, floor: minGap}
 }
 
 func drawN(g *sendGate, n int) []time.Duration {
