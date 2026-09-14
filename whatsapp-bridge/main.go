@@ -354,12 +354,12 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath string, voiceNote bool, logger waLog.Logger) (bool, string) {
-	return sendWhatsAppMedia(ctx, client, messageStore, recipient, message, mediaPath, "", voiceNote, logger)
+func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath string, voiceNote bool, logger waLog.Logger) (bool, string) {
+	return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, recipient, message, mediaPath, "", voiceNote, logger)
 }
 
 // sendWhatsAppMedia is sendWhatsAppMessage with an explicit document title.
-func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, recipient, message, mediaPath, title string, voiceNote bool, logger waLog.Logger) (bool, string) {
+func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath, title string, voiceNote bool, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -385,12 +385,20 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 		}
 	}
 
+	// Captured before verifyRecipientRegistered's own canonicalisation, to
+	// match the first-contact check it runs internally against the same,
+	// original recipient.
+	firstContact := isFirstContact(messageStore, recipientJID)
+
 	// Before the first ever message to someone, confirm the number is really on
 	// WhatsApp. An undeliverable first-contact attempt still counts against
 	// WhatsApp's reach-out limit, so a bad number is much cheaper caught here.
 	canonicalJID, err := verifyRecipientRegistered(ctx, client, messageStore, recipientJID)
 	if err != nil {
 		return false, fmt.Sprintf("Refusing to send: %v", err)
+	}
+	if refuse, reason := refuseFirstContactDuringTimelock(firstContact, reachoutLock); refuse {
+		return false, reason
 	}
 	if canonicalJID != recipientJID {
 		// The registration check caches PN->LID under this spelling; sending to
@@ -550,6 +558,10 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 	resp, err := client.SendMessage(ctx, recipientJID, msg)
 
 	if err != nil {
+		if isReachoutTimelockSendError(err) {
+			reachoutLock.set(true, "", time.Time{}, "send-463")
+			logger.Warnf("Reach-out time-lock hit while sending: %v", err)
+		}
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
@@ -951,12 +963,12 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, reachoutLock *reachoutTimelock, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 	dispatcher := pub.dispatcher
 
 	queue := newSendQueue(newSendGateFromEnv(), func(ctx context.Context, req SendMessageRequest) (bool, string) {
-		return sendWhatsAppMedia(ctx, client, messageStore, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
+		return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
 	})
 	go queue.run(queueCtx)
 
@@ -974,11 +986,30 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 		w.Header().Set("Content-Type", "application/json")
 		nctSalt, _ := hasNCTSalt(r.Context(), client.Store.NCTSalt)
 		json.NewEncoder(w).Encode(map[string]any{
-			"connected": client.IsConnected(),
-			"logged_in": loggedIn,
-			"jid":       jid,
-			"nct_salt":  nctSalt,
+			"connected":         client.IsConnected(),
+			"logged_in":         loggedIn,
+			"jid":               jid,
+			"nct_salt":          nctSalt,
+			"reachout_timelock": reachoutLock.state(),
 		})
+	})
+
+	// Unlike the passive tracking above (a notification, or a 463 on a send),
+	// this asks WhatsApp directly, so it also updates reachoutLock as a
+	// side effect (source "query").
+	mux.HandleFunc("/api/reachout-timelock", func(w http.ResponseWriter, r *http.Request) {
+		if !requireReady(client, w) {
+			return
+		}
+		active, enforcementType, ends, err := queryReachoutTimelock(r.Context(), client.DangerousInternals())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		reachoutLock.set(active, enforcementType, ends, "query")
+		json.NewEncoder(w).Encode(reachoutLock.state())
 	})
 
 	mux.HandleFunc("/api/send", sendHandler(queue, messageStore.StoreDir, func(w http.ResponseWriter) bool {
@@ -1305,6 +1336,8 @@ func main() {
 		transcriber.ReleasePending()
 	}
 
+	reachoutLock := &reachoutTimelock{}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -1336,6 +1369,9 @@ func main() {
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 			pub.PublishBridgeStatus(client.IsConnected(), false, "")
+
+		case *events.NotifyAccountReachoutTimelock:
+			handleReachoutTimelockNotification(reachoutLock, v, logger)
 		}
 	})
 
@@ -1347,7 +1383,7 @@ func main() {
 	queueCtx, stopQueue := context.WithCancel(ctx)
 	defer stopQueue()
 
-	server := startRESTServer(queueCtx, client, messageStore, pub, transcriber, bridgeAddr, socketGroup, logBodies, logger)
+	server := startRESTServer(queueCtx, client, messageStore, pub, transcriber, reachoutLock, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {

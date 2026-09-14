@@ -150,6 +150,15 @@ class WhatsAppClient:
     def status(self) -> Dict[str, Any]:
         return self._json("GET", "/status")
 
+    def reachout_timelock(self) -> Dict[str, Any]:
+        """Ask WhatsApp directly for the account's reach-out time-lock state.
+
+        `{active, enforcement_type, ends, checked_at}` — the same shape as
+        `status()["reachout_timelock"]`, but freshly queried rather than the
+        last passively-reported value.
+        """
+        return self._json("GET", "/reachout-timelock")
+
     # --- chats and contacts ---
 
     def list_chats(

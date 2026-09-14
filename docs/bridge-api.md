@@ -10,7 +10,16 @@ open it has full access, so there is no authentication). Errors are
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/status` | `{connected, logged_in, jid}`; always 200 |
+| GET | `/status` | `{connected, logged_in, jid, nct_salt, reachout_timelock}`; always 200 |
+| GET | `/reachout-timelock` | *ready*. Asks WhatsApp directly for the account's reach-out time-lock state (see below) instead of waiting for a passive report, and updates it as a side effect. `502` if the query itself fails. |
+
+`reachout_timelock`: `{active, enforcement_type, ends, checked_at}` —
+WhatsApp's server-side rate limit on first-contact sends (error 463 on the
+send that trips it). `ends` and `checked_at` are RFC 3339 or `null`. Tracked
+from three sources: an unsolicited WhatsApp notification, a `/reachout-timelock`
+query, and a 463 seen on a send — whichever last reported. A first-contact
+`/send` is refused outright while it is active; an established chat is never
+affected.
 
 ## Reading
 
