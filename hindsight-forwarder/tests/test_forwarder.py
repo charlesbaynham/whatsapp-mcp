@@ -45,6 +45,7 @@ class FilterTests(unittest.TestCase):
         self.assertFalse(wants(cfg, ev(3, type="chat.read")))
         self.assertFalse(wants(cfg, ev(4, is_from_me=True)))
         self.assertTrue(wants(forwarding_config(), ev(5, chat="anything@g.us")))
+        self.assertTrue(wants(cfg, ev(6, type="poll.vote")))
 
 
 class TranscriptTests(unittest.TestCase):
@@ -60,6 +61,18 @@ class TranscriptTests(unittest.TestCase):
         self.assertIn("(voice note) later", transcript_line(cfg, {"media_type": "audio", "transcript": "later"}))
         self.assertIn("[image: a.jpg] look", transcript_line(cfg, {"media_type": "image", "filename": "a.jpg", "content": "look"}))
         self.assertIn("transcription failed", transcript_line(cfg, {"media_type": "audio", "transcription_status": "failed"}))
+
+    def test_line_renders_polls_and_votes(self):
+        cfg = forwarding_config()
+        poll = {"question": "Lunch?", "options": ["Pizza", "Sushi"], "selectable_count": 0, "results": [], "total_voters": 0}
+        self.assertIn("Alice: (poll) Lunch? — options: Pizza / Sushi (pick any number)",
+                      transcript_line(cfg, {"sender_name": "Alice", "media_type": "poll", "content": "Lunch?", "poll": poll}))
+        vote = {"poll_id": "p1", "question": "Lunch?", "selected": ["Pizza"], "total_voters": 1,
+                "results": [{"option": "Pizza", "votes": 1}, {"option": "Sushi", "votes": 0}]}
+        self.assertIn('Bob: voted "Pizza" on the poll "Lunch?" (now Pizza 1, Sushi 0 (1 voter))',
+                      transcript_line(cfg, {"sender_name": "Bob", "poll_vote": vote}))
+        vote["selected"] = []
+        self.assertIn("Bob: withdrew their vote on the poll", transcript_line(cfg, {"sender_name": "Bob", "poll_vote": vote}))
 
     def test_sender_falls_back_to_number(self):
         self.assertIn("447700900123:", transcript_line(forwarding_config(), {"sender": "447700900123", "content": "x"}))

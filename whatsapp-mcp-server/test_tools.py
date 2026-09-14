@@ -52,6 +52,29 @@ class ErrorFoldingTests(unittest.TestCase):
             self.assertFalse(main.get_send_status("snd-1")["success"])
         self.assertFalse(main.get_send_status("")["success"])
 
+    def test_send_poll_validates_then_queues(self):
+        with mock.patch.object(main.wa, "send_poll", return_value={"success": True, "queued": True, "id": "snd-1"}) as sp:
+            out = main.send_poll("g@g.us", " Lunch? ", ["Pizza", " Sushi", ""], selectable_count=0)
+        self.assertTrue(out["queued"])
+        sp.assert_called_once_with("g@g.us", "Lunch?", ["Pizza", "Sushi"], selectable_count=0, block=False)
+        with mock.patch.object(main.wa, "send_poll") as sp:
+            self.assertFalse(main.send_poll("g@g.us", "q", ["only"])["success"])
+            self.assertFalse(main.send_poll("g@g.us", "q", ["a", "a"])["success"])
+            self.assertFalse(main.send_poll("g@g.us", "", ["a", "b"])["success"])
+            sp.assert_not_called()
+        with mock.patch.object(main.wa, "send_poll", side_effect=BridgeError("queue full", status=503)):
+            self.assertEqual(main.send_poll("g@g.us", "q", ["a", "b"]), {"success": False, "message": "queue full"})
+
+    def test_get_poll_results_folds_missing_and_errors(self):
+        poll = {"message_id": "p1", "question": "Lunch?", "total_voters": 1}
+        with mock.patch.object(main.wa, "get_poll", return_value=poll):
+            self.assertEqual(main.get_poll_results("g@g.us", "p1"), poll)
+        with mock.patch.object(main.wa, "get_poll", return_value=None):
+            self.assertFalse(main.get_poll_results("g@g.us", "p1")["success"])
+        with mock.patch.object(main.wa, "get_poll", side_effect=BridgeError("down")):
+            self.assertEqual(main.get_poll_results("g@g.us", "p1")["message"], "down")
+        self.assertFalse(main.get_poll_results("", "p1")["success"])
+
     def test_get_reachout_timelock_folds_errors(self):
         with mock.patch.object(main.wa, "reachout_timelock", return_value={"active": True}):
             self.assertTrue(main.get_reachout_timelock()["active"])
@@ -68,6 +91,16 @@ class ReshapeTests(unittest.TestCase):
             out = main.get_last_interaction("c@s.whatsapp.net")
         self.assertIn("[voice note] hello there", out)
         self.assertIn("From: Carol", out)
+
+    def test_last_interaction_formats_poll(self):
+        msg = {"id": "p1", "chat_jid": "g@g.us", "chat_name": "Team", "sender_name": "Alice",
+               "timestamp": "2026-09-14T10:00:00Z", "content": "Lunch?", "media_type": "poll",
+               "poll": {"question": "Lunch?", "options": ["Pizza", "Sushi"], "selectable_count": 1,
+                        "results": [{"option": "Pizza", "votes": 2, "voters": ["Alice", "Bob"]},
+                                    {"option": "Sushi", "votes": 0, "voters": []}], "total_voters": 2}}
+        with mock.patch.object(main.wa, "get_last_interaction", return_value=msg):
+            out = main.get_last_interaction("g@g.us")
+        self.assertIn("[poll] Lunch? — options: Pizza / Sushi — Pizza 2, Sushi 0 (2 voters)", out)
 
     def test_last_interaction_none(self):
         with mock.patch.object(main.wa, "get_last_interaction", return_value=None):

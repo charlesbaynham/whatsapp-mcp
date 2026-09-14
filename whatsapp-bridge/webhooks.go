@@ -127,6 +127,10 @@ type WebhookEvent struct {
 	Transcript          string `json:"transcript,omitempty"`
 	TranscriptionStatus string `json:"transcription_status,omitempty"` // ok, failed, timeout, disabled
 	DurationSeconds     int    `json:"duration_seconds,omitempty"`
+	// Poll is set when the message creates a poll (media_type "poll").
+	Poll *PollView `json:"poll,omitempty"`
+	// PollVote is set on a poll.vote event: the vote and the poll's new tally.
+	PollVote *PollVotePayload `json:"poll_vote,omitempty"`
 }
 
 // createWebhookSubscriptionsTable is called from NewMessageStore alongside the other tables.
@@ -715,6 +719,10 @@ func buildWebhookText(events []WebhookEvent) string {
 		}
 		var content string
 		switch {
+		case e.PollVote != nil:
+			content = describePollVote(e.PollVote)
+		case e.Poll != nil:
+			content = describePoll(e.Poll)
 		case e.Transcript != "":
 			dur := ""
 			if e.DurationSeconds > 0 {

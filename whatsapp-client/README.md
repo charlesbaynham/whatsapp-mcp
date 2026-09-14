@@ -18,8 +18,13 @@ for ev in wa.events(since=0):
 `WHATSAPP_BRIDGE_URL` is either `unix:/path/to/bridge.sock` or an
 `http://host:port` URL (a trailing `/api` is tolerated).
 
-`send_message` / `send_file` return as soon as the bridge has **queued** the
+`send_message` / `send_file` / `send_poll` return as soon as the bridge has **queued** the
 message — sends are rate limited and go out a randomised delay later. The
 returned `id` reads back through `send_status(id)` (`queued`, `sent`, `failed`).
 Pass `block=True` to wait for the send itself instead; that can take minutes,
 and giving up on the wait loses only the outcome, not the message.
+
+`send_poll(recipient, question, options, selectable_count=1)` sends a poll;
+`get_poll(chat_jid, message_id)` reads its outcome back (tally per option and
+each voter's current selection), and `list_polls()` finds the polls. Votes
+arrive on the event stream as `poll.vote` events.

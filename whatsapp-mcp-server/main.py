@@ -85,7 +85,9 @@ def list_messages(
     Voice notes carry the spoken text in `transcript` (with
     `transcription_status`) while `content` stays as WhatsApp delivered it,
     so the two are distinguishable; the audio itself is fetchable via
-    download_media.
+    download_media. A poll has media_type "poll", its question as `content`
+    and a `poll` object with the options and the current tally (see
+    get_poll_results for the per-voter detail).
 
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
@@ -189,6 +191,8 @@ def get_last_interaction(jid: str) -> Optional[str]:
     body = msg.get("content") or ""
     if msg.get("transcript"):
         body = f"[voice note] {msg['transcript']}"
+    if msg.get("poll"):
+        body = _describe_poll(msg["poll"])
     return f"[{msg['timestamp']}] Chat: {msg.get('chat_name') or msg['chat_jid']} From: {msg['sender_name']}: {prefix}{body}\n"
 
 
@@ -316,6 +320,99 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
     else:
         summary = f"Queued {queued} of {len(batch)} message(s); submission stopped: {halted}"
     return {"success": queued == len(batch), "message": summary, "queued": queued, "results": results}
+
+
+def _describe_poll(poll: Dict[str, Any]) -> str:
+    """One line for a poll and its tally, for the text-only tool outputs."""
+    text = f"[poll] {poll.get('question', '')} — options: {' / '.join(poll.get('options') or [])}"
+    if poll.get("selectable_count") == 0:
+        text += " (pick any number)"
+    if poll.get("total_voters"):
+        tally = ", ".join(f"{r.get('option')} {r.get('votes', 0)}" for r in poll.get("results") or [])
+        text += f" — {tally} ({poll['total_voters']} voter{'s' if poll['total_voters'] != 1 else ''})"
+    return text
+
+
+@mcp.tool()
+def send_poll(
+    recipient: str,
+    question: str,
+    options: List[str],
+    selectable_count: int = 1,
+    block: bool = False
+) -> Dict[str, Any]:
+    """Send a WhatsApp poll to a person or group. For group chats use the JID.
+
+    Sending is rate limited and asynchronous, exactly like send_message: this
+    returns as soon as the bridge has queued the poll, with `queued: true` and
+    an `id` for get_send_status. Once sent, the poll appears in list_messages
+    as a message with media_type "poll" whose `poll` field carries the current
+    tally; votes arrive as people cast them, so read the outcome back later
+    with get_poll_results (it needs the poll's message id and chat JID, both
+    shown by list_messages), or subscribe_chat to be told about each vote.
+
+    Args:
+        recipient: The recipient - either a phone number with country code but no + or other symbols,
+                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        question: The poll question (up to 255 characters)
+        options: Between 2 and 12 distinct, non-empty answer options (up to 100 characters each)
+        selectable_count: How many options a voter may pick: 1 (default) for a single
+                 choice, 0 for any number, or any value up to the number of options
+        block: Wait for the poll to actually leave and return the send's own outcome
+                 (default False). The wait is the rate limit's and can run to minutes.
+
+    Returns:
+        A dictionary containing success status, a status message, and the
+        submission id
+    """
+    if not recipient:
+        return {"success": False, "message": "Recipient must be provided"}
+    if not question or not question.strip():
+        return {"success": False, "message": "question must be provided"}
+    opts = [o.strip() for o in (options or []) if o and o.strip()]
+    if len(opts) < 2:
+        return {"success": False, "message": "A poll needs at least 2 non-empty options"}
+    if len(set(opts)) != len(opts):
+        return {"success": False, "message": "Poll options must be distinct"}
+    return _result(lambda: wa.send_poll(recipient, question.strip(), opts,
+                                        selectable_count=selectable_count, block=block))
+
+
+@mcp.tool()
+def get_poll_results(chat_jid: str, message_id: str) -> Dict[str, Any]:
+    """Read the current outcome of a WhatsApp poll, sent by anyone in the chat.
+
+    Returns the question, options, `results` (one `{option, votes, voters}` per
+    option, in poll order), `total_voters`, and `votes` (each voter's current
+    selection with a timestamp). WhatsApp lets a voter change or withdraw
+    their vote, so this is the state now, not a log; call it again later for
+    an updated tally. list_polls / list_messages show which polls exist.
+
+    Args:
+        chat_jid: The JID of the chat the poll was sent in
+        message_id: The poll's message id, as shown by list_messages or list_polls
+    """
+    if not chat_jid or not message_id:
+        return {"success": False, "message": "chat_jid and message_id must be provided"}
+    try:
+        out = wa.get_poll(chat_jid, message_id)
+    except BridgeError as e:
+        return {"success": False, "message": str(e)}
+    if out is None:
+        return {"success": False, "message": f"No poll {message_id} in chat {chat_jid}"}
+    return out
+
+
+@mcp.tool()
+def list_polls(chat_jid: Optional[str] = None, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
+    """List WhatsApp polls, newest first, each with its current tally in `poll`.
+
+    Args:
+        chat_jid: Optional chat JID to restrict the list to one chat
+        limit: Maximum number of polls to return (default 20)
+        page: Page number for pagination (default 0)
+    """
+    return wa.list_polls(chat_jid=chat_jid, limit=limit, page=page)
 
 
 @mcp.tool()

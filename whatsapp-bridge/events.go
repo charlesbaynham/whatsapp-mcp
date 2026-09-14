@@ -23,6 +23,7 @@ const (
 	eventMessageUpdated = "message.updated"
 	eventChatRead       = "chat.read"
 	eventBridgeStatus   = "bridge.status"
+	eventPollVote       = "poll.vote"
 
 	sseReplayBatch   = 500
 	sseHeartbeat     = 15 * time.Second
@@ -213,6 +214,18 @@ func (p *Publisher) PublishMessage(msg WebhookEvent) {
 func (p *Publisher) PublishMessageUpdated(msg WebhookEvent) {
 	if _, err := p.Publish(eventMessageUpdated, msg.ChatJID, msg.MessageID, msg.IsFromMe, msg); err != nil {
 		p.logger.Warnf("Failed to publish message.updated event: %v", err)
+	}
+}
+
+// PublishPollVote publishes a vote on a poll, with the poll's new tally in
+// msg.PollVote. Webhooks fire for it like a message: a subscriber waiting
+// on a poll's outcome wants to hear each vote as it lands.
+func (p *Publisher) PublishPollVote(msg WebhookEvent) {
+	if _, err := p.Publish(eventPollVote, msg.ChatJID, msg.MessageID, msg.IsFromMe, msg); err != nil {
+		p.logger.Warnf("Failed to publish poll.vote event: %v", err)
+	}
+	if p.dispatcher != nil {
+		p.dispatcher.Notify(msg)
 	}
 }
 

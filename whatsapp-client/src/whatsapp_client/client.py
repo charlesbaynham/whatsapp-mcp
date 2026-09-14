@@ -248,6 +248,44 @@ class WhatsAppClient:
         return self._json("POST", "/send", timeout=self._send_timeout(block), ok=SEND_OK,
                           json={"recipient": recipient, "message": message, "block": block})
 
+    def send_poll(
+        self,
+        recipient: str,
+        question: str,
+        options: List[str],
+        *,
+        selectable_count: int = 1,
+        block: bool = False,
+    ) -> Dict[str, Any]:
+        """Queue a poll. Same queue and outcome shape as `send_message`.
+
+        ``selectable_count`` is how many options a voter may pick: 1 (the
+        default) for a single choice, 0 for any number. The poll's message
+        id (in the blocking outcome's message, or later via list_messages)
+        is what `get_poll` takes to read the votes back.
+        """
+        return self._json("POST", "/send", timeout=self._send_timeout(block), ok=SEND_OK, json={
+            "recipient": recipient, "block": block,
+            "poll": {"question": question, "options": list(options), "selectable_count": selectable_count}})
+
+    def get_poll(self, chat_jid: str, message_id: str) -> Optional[Dict[str, Any]]:
+        """A poll with its current outcome: `{question, options, results, total_voters, votes, ...}`.
+
+        ``results`` is one `{option, votes, voters}` per option in poll order;
+        ``votes`` is each voter's current selection. None if the message is
+        not a poll the bridge knows.
+        """
+        try:
+            return self._json("GET", f"/polls/{chat_jid}/{message_id}")
+        except BridgeError as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def list_polls(self, chat_jid: Optional[str] = None, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
+        """Poll messages newest first, each with its `poll` outcome attached."""
+        return self._json("GET", "/polls", params=self._params(chat_jid=chat_jid, limit=limit, page=page))
+
     def send_status(self, send_id: str) -> Dict[str, Any]:
         """Look up a queued send: `{id, state, success, message, ...}`.
 
