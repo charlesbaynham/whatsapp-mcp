@@ -388,8 +388,16 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 	// Before the first ever message to someone, confirm the number is really on
 	// WhatsApp. An undeliverable first-contact attempt still counts against
 	// WhatsApp's reach-out limit, so a bad number is much cheaper caught here.
-	if err := verifyRecipientRegistered(ctx, client, messageStore, recipientJID); err != nil {
+	canonicalJID, err := verifyRecipientRegistered(ctx, client, messageStore, recipientJID)
+	if err != nil {
 		return false, fmt.Sprintf("Refusing to send: %v", err)
+	}
+	if canonicalJID != recipientJID {
+		// The registration check caches PN->LID under this spelling; sending to
+		// the one we were given would miss that cache and fail with "no LID
+		// found" even though the number is registered.
+		logger.Infof("Sending to %s (canonical form of %s)", canonicalJID.User, recipientJID.User)
+		recipientJID = canonicalJID
 	}
 
 	msg := &waProto.Message{}

@@ -66,29 +66,46 @@ func needsRegistrationCheck(recipient types.JID) bool {
 // would defeat it. The caller sees a distinct message and can retry.
 //
 // A successful check is not wasted work: IsOnWhatsApp caches the PN->LID
-// mapping it gets back, which is the mapping the send path needs immediately
-// afterwards.
-func verifyRecipientRegistered(ctx context.Context, checker registrationChecker, chats chatExistenceChecker, recipient types.JID) error {
+// mapping it gets back — but under WhatsApp's own canonical spelling of the
+// phone number, not necessarily the one queried (a Mexican number stored as
+// 52+10 digits is cached as 521+10). The canonical JID is therefore returned
+// so the caller can send to the number the cache actually holds.
+func verifyRecipientRegistered(ctx context.Context, checker registrationChecker, chats chatExistenceChecker, recipient types.JID) (types.JID, error) {
 	if checker == nil || !needsRegistrationCheck(recipient) || !isFirstContact(chats, recipient) {
-		return nil
+		return recipient, nil
 	}
 
 	phone := recipient.User
 	resp, err := checker.IsOnWhatsApp(ctx, []string{phone})
 	if err != nil {
-		return fmt.Errorf("could not check whether %s is on WhatsApp: %w", phone, err)
+		return recipient, fmt.Errorf("could not check whether %s is on WhatsApp: %w", phone, err)
 	}
 
 	for _, info := range resp {
 		if !matchesQueriedNumber(info, phone) {
 			continue
 		}
-		if info.IsIn {
-			return nil
+		if !info.IsIn {
+			return recipient, fmt.Errorf("%s is not on WhatsApp", phone)
 		}
-		return fmt.Errorf("%s is not on WhatsApp", phone)
+		return canonicalRecipient(info, recipient), nil
 	}
-	return fmt.Errorf("WhatsApp returned no registration status for %s", phone)
+	return recipient, fmt.Errorf("WhatsApp returned no registration status for %s", phone)
+}
+
+// canonicalRecipient picks the phone-number JID to actually send to out of a
+// matched usync entry, preferring the dedicated pn_jid field and falling back
+// to JID itself when that is already a phone number. A LID-only entry (no
+// phone-number field populated) carries nothing to rewrite to, so the original
+// recipient stands.
+func canonicalRecipient(info types.IsOnWhatsAppResponse, fallback types.JID) types.JID {
+	if info.PhoneNumber.Server == types.DefaultUserServer && info.PhoneNumber.User != "" {
+		return info.PhoneNumber
+	}
+	if info.JID.Server == types.DefaultUserServer && info.JID.User != "" {
+		return info.JID
+	}
+	return fallback
 }
 
 // matchesQueriedNumber reports whether a usync response entry is the answer to
