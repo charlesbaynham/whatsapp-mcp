@@ -263,10 +263,9 @@ func TestBlockingSendToAFirstContactIsRefused(t *testing.T) {
 	chats := fakeChats{known: map[string]bool{"447700900001@s.whatsapp.net": true}}
 	q.newContacts = newNewContactStage(newTestGate(30*time.Minute), func(r string) bool { return isNewContact(chats, r) },
 		func() (bool, time.Time) { return false, time.Time{} })
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go q.run(ctx)
-
+	// No worker yet, so the first contact submitted below stays held and the
+	// refusal's estimate is exactly one mean gap rather than whatever the
+	// stage happened to draw if it had already released it.
 	post := func(body string) (*httptest.ResponseRecorder, SendMessageResponse) {
 		r := httptest.NewRequest("POST", "/api/send", strings.NewReader(body))
 		r.Header.Set("Content-Type", "application/json")
@@ -279,7 +278,7 @@ func TestBlockingSendToAFirstContactIsRefused(t *testing.T) {
 		return w, res
 	}
 
-	// Send one first contact so the next would be a gap out, then block on it.
+	// Hold one first contact so the next would be a gap out, then block on it.
 	_, _ = post(`{"recipient":"447700900000","message":"hi"}`)
 	before := q.pending()
 	w, res := post(`{"recipient":"447700900002","message":"hi","block":true}`)
@@ -300,6 +299,9 @@ func TestBlockingSendToAFirstContactIsRefused(t *testing.T) {
 
 	// The same recipient without block is queued as usual, and a blocking send
 	// into an established chat still blocks and returns the outcome.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go q.run(ctx)
 	if w, res := post(`{"recipient":"447700900002","message":"hi"}`); w.Code != http.StatusAccepted || !res.NewContact {
 		t.Fatalf("async first contact: %d %+v", w.Code, res)
 	}
