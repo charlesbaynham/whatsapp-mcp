@@ -263,6 +263,9 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_message_context**: Retrieve context around a specific message
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
 - **send_messages**: Queue several messages in one call — same queue, same spacing, one approval; reports how many are new contacts and when the last is expected to leave
+- **send_poll**: Send a WhatsApp poll (question, 2–12 options, single or multiple choice) through the same queue
+- **get_poll_results**: Read a poll's current outcome: per-option tallies with voter names, and each voter's selection
+- **list_polls**: List polls, newest first, each with its current tally
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
@@ -272,6 +275,28 @@ Claude can access the following tools to interact with WhatsApp:
 - **enable_subscription**: Re-enable a subscription that the bridge auto-disabled, or that expired
 - **list_subscriptions**: List all subscriptions (bearer tokens are masked, only a 4-character hint is shown)
 - **test_subscription**: Send a one-off test event to a subscription's URL to confirm it's wired correctly
+
+### Polls
+
+`send_poll(recipient, question, options, selectable_count=1)` queues a poll
+like any other send. Once it has gone out it is a message with `media_type:
+"poll"` whose `content` is the question and whose `poll` field carries the
+options and the current tally, so it shows up in `list_messages` and
+`get_chat` like anything else. Votes are collected as they arrive — WhatsApp
+sends each one to the chat, encrypted against the poll, and the bridge
+decrypts it, replaces the voter's previous choice, and publishes a
+`poll.vote` event (which fires chat subscriptions, so a Routine watching the
+chat hears each vote). `get_poll_results(chat_jid, message_id)` returns the
+outcome: one `{option, votes, voters}` per option plus every voter's current
+selection. It is a snapshot, not a log: a voter can change or withdraw their
+vote, so read it again when you need the latest state. Polls sent from the
+phone, and polls other people send, are tracked the same way.
+
+Two limits worth knowing. Votes can only be decrypted for polls the bridge
+saw created (live, or in history sync, which carries the key); a vote on a
+poll it never saw is logged and dropped. And a vote's timestamp is the
+voter's clock, used only to keep an out-of-order older vote from overwriting
+a newer one.
 
 ### Chat subscriptions (webhooks)
 

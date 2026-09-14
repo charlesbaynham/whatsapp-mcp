@@ -108,6 +108,10 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := createPollTables(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	for col, ddl := range map[string]string{"transcript": "TEXT", "transcription_status": "TEXT NOT NULL DEFAULT ''"} {
 		if err := ensureColumn(db, "messages", col, ddl); err != nil {
 			db.Close()
@@ -358,9 +362,15 @@ type SendMessageRequest struct {
 	// Block waits for the message to actually go out rather than returning as
 	// soon as it is queued. The wait is the rate limit's, so it can be minutes.
 	Block bool `json:"block,omitempty"`
+	// Poll sends a poll instead of text or media: a question, its options and
+	// how many a voter may pick. Votes are collected as they arrive and read
+	// back at GET /api/polls/{chat_jid}/{message_id}.
+	Poll *PollRequest `json:"poll,omitempty"`
 	// uploadName is the original filename of a multipart upload, used as the
 	// document title instead of the temp file's name.
 	uploadName string
+	// poll is Poll once validated by the handler.
+	poll *PollSpec
 }
 
 // parseRecipient turns the recipient string /api/send accepts — a bare phone
@@ -375,11 +385,12 @@ func parseRecipient(recipient string) (types.JID, error) {
 
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath string, voiceNote bool, logger waLog.Logger) (bool, string) {
-	return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, recipient, message, mediaPath, "", voiceNote, logger)
+	return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, recipient, message, mediaPath, "", voiceNote, nil, logger)
 }
 
-// sendWhatsAppMedia is sendWhatsAppMessage with an explicit document title.
-func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath, title string, voiceNote bool, logger waLog.Logger) (bool, string) {
+// sendWhatsAppMedia is sendWhatsAppMessage with an explicit document title,
+// or, with poll set, a poll instead of text or media.
+func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath, title string, voiceNote bool, poll *PollSpec, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -415,7 +426,11 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 	msg := &waProto.Message{}
 
 	// Check if we have media to send
-	if mediaPath != "" {
+	if poll != nil {
+		// BuildPollCreation also mints the message secret that whatsmeow
+		// stores on send, which is what lets the votes be decrypted later.
+		msg = buildPollMessage(client, *poll)
+	} else if mediaPath != "" {
 		resolvedPath, err := containExistingPath(messageStore.StoreDir, mediaPath)
 		if err != nil {
 			return false, fmt.Sprintf("Rejected media_path: %v", err)
@@ -576,6 +591,11 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 	// store here, or it delivers but never appears in list_messages/get_chat.
 	chatJID := recipientJID.String()
 	mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	content := message
+	if poll != nil {
+		content = poll.Question
+		mediaType = mediaTypePoll
+	}
 	sender := ""
 	if client.Store.ID != nil {
 		sender = client.Store.ID.User
@@ -584,9 +604,15 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 	if err := messageStore.StoreChat(chatJID, name, resp.Timestamp); err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
 	}
-	if err := messageStore.StoreMessage(resp.ID, chatJID, sender, message, resp.Timestamp, true,
+	if err := messageStore.StoreMessage(resp.ID, chatJID, sender, content, resp.Timestamp, true,
 		mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
 		logger.Warnf("Failed to store sent message: %v", err)
+	}
+	if poll != nil {
+		if err := messageStore.StorePoll(resp.ID, chatJID, *poll); err != nil {
+			logger.Warnf("Failed to store sent poll: %v", err)
+		}
+		return true, fmt.Sprintf("Poll sent to %s as message %s", recipient, resp.ID)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -651,6 +677,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
 
+	// A vote updates a poll already in the store rather than being a
+	// message of its own, so it neither bumps the chat nor gets a row.
+	if msg.Message.GetPollUpdateMessage() != nil {
+		handlePollVote(ctx, client, messageStore, pub, msg, chatJID, name, sender, logger)
+		return
+	}
+
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
@@ -662,6 +695,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+
+	// A poll is stored as its question, with the options alongside.
+	poll := extractPoll(msg.Message)
+	if poll != nil {
+		content = poll.Question
+		mediaType = mediaTypePoll
+	}
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -689,6 +729,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 		logger.Warnf("Failed to store message: %v", err)
 		return
 	}
+	if poll != nil {
+		if err := messageStore.StorePoll(msg.Info.ID, chatJID, *poll); err != nil {
+			logger.Warnf("Failed to store poll: %v", err)
+		}
+	}
 
 	// Voice notes wait for their transcript before publication, so every
 	// consumer sees one event with the text attached rather than two.
@@ -711,7 +756,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 				IsFromMe:   msg.Info.IsFromMe,
 				MediaType:  mediaType,
 				Filename:   filename,
-				HasMedia:   mediaType != "",
+				HasMedia:   mediaType != "" && mediaType != mediaTypePoll,
+			}
+			if poll != nil {
+				view := tallyPoll(*poll, nil)
+				ev.Poll = &view
 			}
 			if mediaType == "audio" {
 				ev.TranscriptionStatus = transcriptionDisabled
@@ -854,7 +903,7 @@ func downloadMedia(ctx context.Context, client *whatsmeow.Client, messageStore *
 	}
 
 	// Check if this is a media message
-	if mediaType == "" {
+	if mediaType == "" || mediaType == mediaTypePoll {
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
@@ -972,7 +1021,7 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 	dispatcher := pub.dispatcher
 
 	queue := newSendQueue(newSendGateFromEnv(), func(ctx context.Context, req SendMessageRequest) (bool, string) {
-		return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
+		return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, req.poll, logger)
 	})
 	queue.newContacts = newNewContactStage(newNewContactGateFromEnv(), func(recipient string) bool {
 		return isNewContact(messageStore, recipient)
@@ -981,6 +1030,7 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
 	registerReadRoutes(mux, messageStore)
+	registerPollRoutes(mux, messageStore)
 	registerEventRoutes(mux, messageStore, pub)
 	registerTranscribeRoutes(mux, messageStore, transcriber)
 
@@ -1617,8 +1667,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
+				var poll *PollSpec
 				if msg.Message.Message != nil {
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					if poll = extractPoll(msg.Message.Message); poll != nil {
+						content = poll.Question
+						mediaType = mediaTypePoll
+					}
 				}
 
 				if logBodies {
@@ -1691,6 +1746,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
 					continue
+				}
+				if poll != nil {
+					if err := messageStore.StorePoll(msgID, chatJID, *poll); err != nil {
+						logger.Warnf("Failed to store history poll: %v", err)
+					}
 				}
 
 				syncedCount++

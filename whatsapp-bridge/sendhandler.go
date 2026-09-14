@@ -58,14 +58,31 @@ func sendHandler(queue *sendQueue, storeDir string, ready func(http.ResponseWrit
 			http.Error(w, "Recipient is required", http.StatusBadRequest)
 			return
 		}
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+		if req.Message == "" && req.MediaPath == "" && req.Poll == nil {
+			http.Error(w, "Message, media path or poll is required", http.StatusBadRequest)
 			return
 		}
+		if req.Poll != nil {
+			if req.MediaPath != "" {
+				http.Error(w, "A poll cannot carry media", http.StatusBadRequest)
+				return
+			}
+			spec, err := req.Poll.validate()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			req.poll = &spec
+		}
 
-		if logBodies {
+		switch {
+		case req.poll != nil && logBodies:
+			fmt.Println("Received request to send poll", req.poll.Question, req.poll.Options)
+		case req.poll != nil:
+			fmt.Println("Received request to send poll to", req.Recipient)
+		case logBodies:
 			fmt.Println("Received request to send message", req.Message, req.MediaPath)
-		} else {
+		default:
 			fmt.Println("Received request to send message to", req.Recipient)
 		}
 

@@ -73,6 +73,25 @@ class RequestShapeTests(unittest.TestCase):
         self.assertEqual(json.loads(rec.requests[0].content),
                          {"recipient": "447700900000", "message": "hello", "block": False})
 
+    def test_send_poll_body(self):
+        client, rec = make_client(lambda r: httpx.Response(202, json={"success": True, "queued": True, "id": "snd-1"}))
+        out = client.send_poll("g@g.us", "Lunch?", ["Pizza", "Sushi"], selectable_count=0)
+        self.assertTrue(out["queued"])
+        self.assertEqual(json.loads(rec.requests[0].content), {
+            "recipient": "g@g.us", "block": False,
+            "poll": {"question": "Lunch?", "options": ["Pizza", "Sushi"], "selectable_count": 0}})
+
+    def test_get_poll_404_is_none(self):
+        client, rec = make_client(lambda r: httpx.Response(404, json={"error": "no poll"}))
+        self.assertIsNone(client.get_poll("g@g.us", "p1"))
+        self.assertEqual(rec.requests[0].url.path, "/api/polls/g@g.us/p1")
+
+    def test_list_polls_params(self):
+        client, rec = make_client(lambda r: httpx.Response(200, json=[]))
+        client.list_polls(chat_jid="g@g.us", limit=5)
+        self.assertEqual(rec.requests[0].url.path, "/api/polls")
+        self.assertEqual(dict(rec.requests[0].url.params), {"chat_jid": "g@g.us", "limit": "5", "page": "0"})
+
     def test_send_file_uploads_data_as_multipart(self):
         client, rec = make_client(lambda r: httpx.Response(200, json={"success": True, "message": "ok"}))
         client.send_file("1", data=io.BytesIO(b"abc"), filename="note.txt", caption="cap", voice_note=True)

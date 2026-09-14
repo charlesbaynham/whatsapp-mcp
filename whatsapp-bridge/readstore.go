@@ -6,6 +6,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -32,6 +33,8 @@ type MessageView struct {
 	// delivered); TranscriptionStatus is ok, pending, failed, timeout or disabled.
 	Transcript          string `json:"transcript,omitempty"`
 	TranscriptionStatus string `json:"transcription_status,omitempty"`
+	// Poll is set for media_type "poll": the question, options and current tally.
+	Poll *PollView `json:"poll,omitempty"`
 }
 
 // ChatView is one chat as the read API returns it.
@@ -86,16 +89,24 @@ func clampPage(limit, page int) (int, int) {
 }
 
 const messageSelectColumns = `m.id, m.chat_jid, COALESCE(c.name, ''), m.sender, COALESCE(m.content, ''), m.timestamp, m.is_from_me,
-	COALESCE(m.media_type, ''), COALESCE(m.filename, ''), COALESCE(m.transcript, ''), COALESCE(m.transcription_status, '')`
+	COALESCE(m.media_type, ''), COALESCE(m.filename, ''), COALESCE(m.transcript, ''), COALESCE(m.transcription_status, ''), COALESCE(m.poll, '')`
 
 func scanMessageView(row interface{ Scan(dest ...any) error }) (MessageView, error) {
 	var v MessageView
 	var ts sql.NullTime
-	if err := row.Scan(&v.ID, &v.ChatJID, &v.ChatName, &v.Sender, &v.Content, &ts, &v.IsFromMe, &v.MediaType, &v.Filename, &v.Transcript, &v.TranscriptionStatus); err != nil {
+	var poll string
+	if err := row.Scan(&v.ID, &v.ChatJID, &v.ChatName, &v.Sender, &v.Content, &ts, &v.IsFromMe, &v.MediaType, &v.Filename, &v.Transcript, &v.TranscriptionStatus, &poll); err != nil {
 		return MessageView{}, err
 	}
 	if ts.Valid {
 		v.Timestamp = ts.Time
+	}
+	if poll != "" {
+		var spec PollSpec
+		if err := json.Unmarshal([]byte(poll), &spec); err == nil {
+			// Tallied later by fillPolls; until then this is the bare poll.
+			v.Poll = &PollView{Question: spec.Question, Options: spec.Options, SelectableCount: spec.SelectableCount}
+		}
 	}
 	return v, nil
 }
@@ -106,10 +117,24 @@ func scanMessageView(row interface{ Scan(dest ...any) error }) (MessageView, err
 type senderNamer struct {
 	store *MessageStore
 	cache map[string]string
+	me    map[string]bool
 }
 
 func (store *MessageStore) newSenderNamer() *senderNamer {
-	return &senderNamer{store: store, cache: map[string]string{}}
+	return &senderNamer{store: store, cache: map[string]string{}, me: map[string]bool{}}
+}
+
+// isMe reports whether sender is this account, judged by whether it has ever
+// sent a message marked is_from_me. Used where the row itself carries no
+// such flag (a poll vote, say).
+func (n *senderNamer) isMe(sender string) bool {
+	if v, ok := n.me[sender]; ok {
+		return v
+	}
+	var one int
+	err := n.store.db.QueryRow(`SELECT 1 FROM messages WHERE sender = ? AND is_from_me = 1 LIMIT 1`, sender).Scan(&one)
+	n.me[sender] = err == nil
+	return n.me[sender]
 }
 
 func (n *senderNamer) name(sender string, isFromMe bool) string {
@@ -163,7 +188,13 @@ func (store *MessageStore) queryMessages(where string, order string, args ...any
 		}
 		out = append(out, v)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := store.fillPolls(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ListMessagesParams mirrors the list_messages tool arguments.

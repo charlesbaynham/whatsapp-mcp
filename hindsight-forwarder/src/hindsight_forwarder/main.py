@@ -140,8 +140,11 @@ def parse_timestamp(value: str) -> Optional[datetime]:
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
+FORWARDED_EVENT_TYPES = ["message.new", "poll.vote"]
+
+
 def wants(cfg: Config, ev: Event) -> bool:
-    if ev.type != "message.new":
+    if ev.type not in FORWARDED_EVENT_TYPES:
         return False
     if cfg.chats and ev.chat_jid not in cfg.chats:
         return False
@@ -156,10 +159,29 @@ def speaker(cfg: Config, msg: Dict[str, Any]) -> str:
     return msg.get("sender_name") or msg.get("sender") or "unknown"
 
 
+def describe_poll_results(results: Any, total_voters: Any) -> str:
+    tally = ", ".join(f"{r.get('option')} {r.get('votes', 0)}" for r in (results or []))
+    n = int(total_voters or 0)
+    return f"{tally} ({n} voter{'s' if n != 1 else ''})"
+
+
 def body(msg: Dict[str, Any]) -> str:
     text = (msg.get("content") or "").strip()
     if msg.get("transcript"):
         return f"(voice note) {msg['transcript'].strip()}"
+    if msg.get("poll_vote"):
+        vote = msg["poll_vote"]
+        outcome = describe_poll_results(vote.get("results"), vote.get("total_voters"))
+        if not vote.get("selected"):
+            return f"withdrew their vote on the poll \"{vote.get('question', '')}\" (now {outcome})"
+        chosen = ", ".join(f'"{s}"' for s in vote["selected"])
+        return f"voted {chosen} on the poll \"{vote.get('question', '')}\" (now {outcome})"
+    if msg.get("poll"):
+        poll = msg["poll"]
+        line = f"(poll) {poll.get('question', '')} — options: {' / '.join(poll.get('options') or [])}"
+        if poll.get("selectable_count") == 0:
+            line += " (pick any number)"
+        return line
     if msg.get("media_type"):
         note = f"[{msg['media_type']}"
         if msg.get("filename"):
@@ -199,7 +221,8 @@ def describe(cfg: Config, msg: Dict[str, Any]) -> str:
     parts = [
         f"{where}.",
         f'Each line is "[date time] Speaker: message"; "{cfg.owner_name}" is the owner of this WhatsApp account.',
-        "Voice notes appear as their transcript; other attachments appear as a bracketed note.",
+        "Voice notes appear as their transcript; other attachments appear as a bracketed note. "
+        "A poll appears as its question and options, and each vote as a line saying who chose what.",
     ]
     if cfg.context_extra:
         parts.append(cfg.context_extra)
@@ -289,7 +312,7 @@ def forward(cfg: Config, hs: Hindsight, state: State, ev: Event) -> None:
 def run(cfg: Config, wa: WhatsAppClient, hs: Hindsight, state: State, *, events: Optional[Iterable[Event]] = None) -> None:
     log.info("forwarding from event %d to %s (chats: %s)", state.cursor, hs.url, ", ".join(sorted(cfg.chats)) or "all")
     stream = events if events is not None else wa.events(
-        since=state.cursor, types=["message.new"], include_from_me=cfg.include_from_me)
+        since=state.cursor, types=FORWARDED_EVENT_TYPES, include_from_me=cfg.include_from_me)
     for ev in stream:
         if wants(cfg, ev):
             forward(cfg, hs, state, ev)
