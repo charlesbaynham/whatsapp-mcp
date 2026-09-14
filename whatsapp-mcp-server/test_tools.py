@@ -52,6 +52,12 @@ class ErrorFoldingTests(unittest.TestCase):
             self.assertFalse(main.get_send_status("snd-1")["success"])
         self.assertFalse(main.get_send_status("")["success"])
 
+    def test_get_reachout_timelock_folds_errors(self):
+        with mock.patch.object(main.wa, "reachout_timelock", return_value={"active": True}):
+            self.assertTrue(main.get_reachout_timelock()["active"])
+        with mock.patch.object(main.wa, "reachout_timelock", side_effect=BridgeError("unreachable")):
+            self.assertFalse(main.get_reachout_timelock()["success"])
+
 
 class ReshapeTests(unittest.TestCase):
     def test_last_interaction_formats_transcript(self):

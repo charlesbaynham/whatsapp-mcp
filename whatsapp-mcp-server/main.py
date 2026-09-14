@@ -335,6 +335,20 @@ def get_send_status(send_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+def get_reachout_timelock() -> Dict[str, Any]:
+    """Check WhatsApp's "reach-out time-lock" — the rate limit on first-contact
+    sends that returns error 463. Established chats are never affected by it.
+
+    Asks WhatsApp directly, rather than reporting only the last passively
+    observed state. `active` (bool), `enforcement_type`, `ends` and
+    `checked_at` (RFC 3339 or null) describe it; while active, sends to anyone
+    not already in a chat with this account are refused before they reach
+    WhatsApp.
+    """
+    return _result(lambda: wa.reachout_timelock())
+
+
+@mcp.tool()
 def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
     """Mark a WhatsApp chat as read. This is the ONLY way read state changes in this
     server: listing or reading messages (list_messages, get_chat, list_chats, etc.)

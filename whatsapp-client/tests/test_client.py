@@ -179,3 +179,13 @@ class SendQueueTests(unittest.TestCase):
         out = client.send_status("snd-1")
         self.assertEqual(rec.requests[0].url.path, "/api/send/snd-1")
         self.assertEqual(out["state"], "failed")
+
+
+class StatusTests(unittest.TestCase):
+    def test_reachout_timelock_queries_the_dedicated_endpoint(self):
+        client, rec = make_client(lambda r: httpx.Response(
+            200, json={"active": True, "enforcement_type": "hard",
+                       "ends": "2026-09-14T12:00:00Z", "checked_at": "2026-09-14T11:00:00Z"}))
+        out = client.reachout_timelock()
+        self.assertEqual(rec.requests[0].url.path, "/api/reachout-timelock")
+        self.assertTrue(out["active"])
