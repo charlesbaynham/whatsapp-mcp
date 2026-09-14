@@ -972,10 +972,12 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 			jid = client.Store.ID.String()
 		}
 		w.Header().Set("Content-Type", "application/json")
+		nctSalt, _ := hasNCTSalt(r.Context(), client.Store.NCTSalt)
 		json.NewEncoder(w).Encode(map[string]any{
 			"connected": client.IsConnected(),
 			"logged_in": loggedIn,
 			"jid":       jid,
+			"nct_salt":  nctSalt,
 		})
 	})
 
@@ -1325,6 +1327,7 @@ func main() {
 				jid = client.Store.ID.String()
 			}
 			pub.PublishBridgeStatus(true, client.Store.ID != nil, jid)
+			go ensureNCTSalt(ctx, client.Store.NCTSalt, client, logger)
 
 		case *events.Disconnected:
 			logger.Warnf("Disconnected from WhatsApp")
