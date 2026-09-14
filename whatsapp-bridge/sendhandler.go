@@ -4,7 +4,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
+
+// queuedMessage describes where a submission landed. A first contact is
+// called out explicitly, with the wait it implies: a caller expecting the
+// usual half-minute would otherwise take a half-hour hold for a failure.
+func queuedMessage(id string, pos queuePosition) string {
+	if !pos.newContact {
+		return fmt.Sprintf("Queued as %s, %d ahead of it", id, pos.ahead)
+	}
+	return fmt.Sprintf("Queued as %s. First contact: this recipient has never been messaged from this account, "+
+		"so it is held in the new-contact queue (%d new contacts ahead of it) and expected to go out in roughly %s",
+		id, pos.ahead, roughDuration(pos.wait))
+}
+
+// roughDuration renders an estimate at the precision an estimate deserves.
+func roughDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "under a minute"
+	case d < time.Hour:
+		return fmt.Sprintf("%d min", int(d.Round(time.Minute)/time.Minute))
+	default:
+		return fmt.Sprintf("%.1f h", d.Hours())
+	}
+}
 
 // sendHandler accepts a message and hands it to the queue. ready reports
 // whether WhatsApp is connected, injected so the handler is testable without a
@@ -44,7 +69,7 @@ func sendHandler(queue *sendQueue, storeDir string, ready func(http.ResponseWrit
 			fmt.Println("Received request to send message to", req.Recipient)
 		}
 
-		job, ahead, queued := queue.submit(req, cleanup)
+		job, pos, queued := queue.submit(req, cleanup)
 		if !queued {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -60,10 +85,13 @@ func sendHandler(queue *sendQueue, storeDir string, ready func(http.ResponseWrit
 		if !req.Block {
 			w.WriteHeader(http.StatusAccepted)
 			json.NewEncoder(w).Encode(SendMessageResponse{
-				Success: true,
-				Queued:  true,
-				ID:      job.id,
-				Message: fmt.Sprintf("Queued as %s, %d ahead of it", job.id, ahead),
+				Success:              true,
+				Queued:               true,
+				NewContact:           pos.newContact,
+				Ahead:                pos.ahead,
+				EstimatedWaitSeconds: int(pos.wait / time.Second),
+				ID:                   job.id,
+				Message:              queuedMessage(job.id, pos),
 			})
 			return
 		}

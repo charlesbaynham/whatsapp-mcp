@@ -10,7 +10,7 @@ open it has full access, so there is no authentication). Errors are
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/status` | `{connected, logged_in, jid, nct_salt, reachout_timelock}`; always 200 |
+| GET | `/status` | `{connected, logged_in, jid, nct_salt, reachout_timelock, send_queue}`; always 200 |
 | GET | `/reachout-timelock` | *ready*. Asks WhatsApp directly for the account's reach-out time-lock state (see below) instead of waiting for a passive report, and updates it as a side effect. `502` if the query itself fails. |
 
 `reachout_timelock`: `{active, enforcement_type, ends, checked_at}` —
@@ -20,6 +20,10 @@ from three sources: an unsolicited WhatsApp notification, a `/reachout-timelock`
 query, and a 463 seen on a send — whichever last reported. A first-contact
 `/send` is refused outright while it is active; an established chat is never
 affected.
+
+`send_queue`: `{pending, new_contacts_held}` — the main send queue's backlog
+(the in-flight send included) and how many first-contact sends are still held
+in the new-contact queue in front of it.
 
 ## Reading
 
@@ -50,8 +54,8 @@ last_is_from_me, unread_count, last_read_at, is_group`.
 
 | Method | Path | Body | Notes |
 | --- | --- | --- | --- |
-| POST | `/send` | JSON `{recipient, message, media_path?, voice_note?, block?}` or `multipart/form-data` with the same fields plus a `file` part | `media_path` must lie inside the store; an upload needs no store access. `voice_note: true` transcodes to Ogg Opus with ffmpeg and sends a playable voice message. **Asynchronous by default**: answers `202` with `{success, queued: true, id}` once the message is on the rate-limited send queue. `block: true` waits for it to leave and answers `200`/`500` with the real outcome — minutes, potentially. `503` when the queue is full. |
-| GET | `/send/{id}` | | ⚠️ Queue and results are in memory: a restart fails everything still waiting and forgets every id. How a submission went: `{id, state, success, message, queued_at, sent_at}`, `state` one of `queued`, `sent`, `failed`. Only recent sends are kept; `404` once one ages out. |
+| POST | `/send` | JSON `{recipient, message, media_path?, voice_note?, block?}` or `multipart/form-data` with the same fields plus a `file` part | `media_path` must lie inside the store; an upload needs no store access. `voice_note: true` transcodes to Ogg Opus with ffmpeg and sends a playable voice message. **Asynchronous by default**: answers `202` with `{success, queued: true, id, ahead, estimated_wait_seconds}` once the message is on the rate-limited send queue. A **first contact** (a person the bridge has no chat with) is held first in a separate new-contact queue spaced ~30 min apart (see the README): the `202` then has `new_contact: true`, `ahead` counts the new contacts in front of it and `estimated_wait_seconds` is hours rather than seconds. `block: true` waits for it to leave and answers `200`/`500` with the real outcome — minutes, potentially; hours for a first contact. `503` when the queue is full. |
+| GET | `/send/{id}` | | ⚠️ Queue and results are in memory: a restart fails everything still waiting and forgets every id. How a submission went: `{id, state, success, message, new_contact, queued_at, sent_at}`, `state` one of `queued`, `sent`, `failed`; `new_contact: true` marks a first contact, which stays `queued` for as long as the new-contact queue holds it. Only recent sends are kept; `404` once one ages out. |
 | POST | `/download` | `{message_id, chat_jid}` | Downloads into the store; returns `{success, message, filename, path}` |
 | GET | `/media/{chat_jid}/{message_id}` | | Streams the attachment's bytes (downloading first if needed) |
 | POST | `/mark-read` | `{chat_jid, send_receipt}` | The only way read state changes. `send_receipt` sends real blue ticks. Emits `chat.read`. |

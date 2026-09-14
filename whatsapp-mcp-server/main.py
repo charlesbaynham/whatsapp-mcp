@@ -26,6 +26,41 @@ wa = WhatsAppClient(os.environ.get("WHATSAPP_BRIDGE_URL", "http://127.0.0.1:8080
 mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
 
 
+# Mean gap the bridge holds between first contacts, for the warning below. The
+# bridge's own estimate is what gets reported; this only sets expectations.
+NEW_CONTACT_GAP_NOTE = "spaced about 30 minutes apart on average"
+
+
+def _rough_duration(seconds: float) -> str:
+    if seconds < 60:
+        return "under a minute"
+    if seconds < 3600:
+        return f"about {round(seconds / 60)} min"
+    return f"about {seconds / 3600:.1f} h"
+
+
+def _note_new_contact(out: Dict[str, Any]) -> Dict[str, Any]:
+    """Add a warning to a send reply the bridge has marked `new_contact`.
+
+    A first contact does not go out after the usual half-minute: the bridge
+    holds it in a separate queue, spaced far more widely, because starting
+    conversations with a run of strangers is the single strongest spam signal
+    WhatsApp acts on. Whoever asked for the send will not expect that, so the
+    calling agent is told to say so.
+    """
+    if not out.get("new_contact"):
+        return out
+    wait = _rough_duration(float(out.get("estimated_wait_seconds") or 0))
+    out["warning"] = (
+        "This recipient has never been messaged from this account, so the bridge is "
+        f"holding the message in its new-contact queue (first contacts are {NEW_CONTACT_GAP_NOTE}) "
+        f"before it joins the normal send queue. Expected to go out in {wait}. "
+        "Tell the user the message is queued and roughly when it will be sent; "
+        "poll get_send_status with the id if they need to know once it has gone."
+    )
+    return out
+
+
 def _result(call, **extra: Any) -> Dict[str, Any]:
     """Run a bridge call and fold any error into a {success, message} dict."""
     try:
@@ -222,6 +257,12 @@ def send_message(
     spacing is deliberate, it keeps WhatsApp from unlinking the account for
     behaving like a bulk sender.
 
+    ⚠️ A **first contact** — someone this account has never messaged — is held
+    much longer: the bridge queues first contacts separately, spaced about 30
+    minutes apart on average, before they join the normal queue. The reply then
+    carries `new_contact: true`, `estimated_wait_seconds` and a `warning`. Tell
+    the user, so they know the message is not going out immediately.
+
     Sending more than one message? Use send_messages instead: it queues the
     whole batch through the same path, in one tool call.
 
@@ -240,7 +281,7 @@ def send_message(
     """
     if not recipient:
         return {"success": False, "message": "Recipient must be provided"}
-    return _result(lambda: wa.send_message(recipient, message, block=block))
+    return _note_new_contact(_result(lambda: wa.send_message(recipient, message, block=block)))
 
 
 class OutgoingMessage(BaseModel):
@@ -269,13 +310,25 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
     ones already queued still go out, and the rest are reported as not
     submitted so you can retry them.
 
+    ⚠️ Messages to **first contacts** — people this account has never messaged,
+    the typical case when the same note goes to everyone from a group — are
+    held far longer than the usual spacing: the bridge queues them separately,
+    about 30 minutes apart on average, before they join the normal queue. A
+    batch of ten strangers therefore takes hours to go out, not minutes. The
+    reply says how many of the batch are first contacts and roughly when the
+    last message is expected to leave; tell the user, and do not resend
+    anything that is merely still queued.
+
     Args:
         messages: The messages to queue, each with a recipient and text
 
     Returns:
-        `{success, message, queued, results}`, where `results` has one entry per
-        input message with its `recipient`, submission `id` and outcome. Pass an
-        id to get_send_status to see how that message actually went.
+        `{success, message, queued, new_contacts, estimated_completion_seconds,
+        results}`, where `results` has one entry per input message with its
+        `recipient`, submission `id`, outcome and, for a first contact,
+        `new_contact: true` and its own `estimated_wait_seconds`. A `warning`
+        is present whenever any message is a first contact. Pass an id to
+        get_send_status to see how that message actually went.
     """
     try:
         # FastMCP hands over parsed models; a direct caller may pass dicts.
@@ -304,8 +357,13 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
             continue
         out = _result(lambda i=item: wa.send_message(i.recipient, i.message))
         ok = bool(out.get("success"))
-        results.append({"recipient": item.recipient, "success": ok,
-                        "id": out.get("id"), "message": out.get("message", "")})
+        entry = {"recipient": item.recipient, "success": ok,
+                 "id": out.get("id"), "message": out.get("message", "")}
+        if out.get("new_contact"):
+            entry["new_contact"] = True
+        if "estimated_wait_seconds" in out:
+            entry["estimated_wait_seconds"] = out["estimated_wait_seconds"]
+        results.append(entry)
         if ok:
             queued += 1
         else:
@@ -315,7 +373,23 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
         summary = f"Queued {queued} message(s); they go out spaced by the rate limit"
     else:
         summary = f"Queued {queued} of {len(batch)} message(s); submission stopped: {halted}"
-    return {"success": queued == len(batch), "message": summary, "queued": queued, "results": results}
+
+    new_contacts = sum(1 for r in results if r.get("new_contact"))
+    # Each estimate is from submission, moments apart, so the latest one is
+    # when the whole batch is expected to have left.
+    completion = max((float(r.get("estimated_wait_seconds") or 0) for r in results if r["success"]), default=0.0)
+    reply: Dict[str, Any] = {"success": queued == len(batch), "message": summary, "queued": queued,
+                             "new_contacts": new_contacts, "estimated_completion_seconds": int(completion),
+                             "results": results}
+    if new_contacts:
+        reply["warning"] = (
+            f"{new_contacts} of the {queued} queued message(s) go to first contacts — people this account has "
+            f"never messaged — which the bridge holds in a separate queue, {NEW_CONTACT_GAP_NOTE}, before they "
+            f"join the normal send queue. The last of the batch is expected to go out in {_rough_duration(completion)}. "
+            "Tell the user the messages are queued and roughly how long they will take; do not resend anything "
+            "that is merely still queued, and poll get_send_status with an id if they need to know once it has gone."
+        )
+    return reply
 
 
 @mcp.tool()
@@ -323,8 +397,11 @@ def get_send_status(send_id: str) -> Dict[str, Any]:
     """Look up how a queued send went, by the id send_message returned.
 
     `state` is queued (still waiting behind the rate limit), sent, or failed;
-    `message` carries the bridge's own reason on a failure. Only recent sends
-    are kept, so an unknown id means it has aged out, not that it failed.
+    `message` carries the bridge's own reason on a failure. `new_contact: true`
+    marks a first contact, which waits in the bridge's separate new-contact
+    queue (spaced about 30 minutes apart on average) before the normal one, so
+    "queued" can last hours for those. Only recent sends are kept, so an
+    unknown id means it has aged out, not that it failed.
 
     Args:
         send_id: The id returned by send_message, send_file or send_audio_message
@@ -380,7 +457,9 @@ def send_file(recipient: str, media_path: str, block: bool = False) -> Dict[str,
     has queued the message, with `queued: true` and an `id` you can pass to
     get_send_status. The message goes out a short, randomised delay later — that
     spacing is deliberate, it keeps WhatsApp from unlinking the account for
-    behaving like a bulk sender.
+    behaving like a bulk sender. A first contact (someone this account has never
+    messaged) is held much longer — see send_message — and the reply then
+    carries `new_contact: true` and a `warning` to pass on to the user.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
@@ -399,7 +478,7 @@ def send_file(recipient: str, media_path: str, block: bool = False) -> Dict[str,
     """
     if not recipient or not media_path:
         return {"success": False, "message": "recipient and media_path must be provided"}
-    return _result(lambda: wa.send_file(recipient, path=media_path, block=block))
+    return _note_new_contact(_result(lambda: wa.send_file(recipient, path=media_path, block=block)))
 
 
 @mcp.tool()
@@ -410,7 +489,9 @@ def send_audio_message(recipient: str, media_path: str, block: bool = False) -> 
     has queued the message, with `queued: true` and an `id` you can pass to
     get_send_status. The message goes out a short, randomised delay later — that
     spacing is deliberate, it keeps WhatsApp from unlinking the account for
-    behaving like a bulk sender.
+    behaving like a bulk sender. A first contact (someone this account has never
+    messaged) is held much longer — see send_message — and the reply then
+    carries `new_contact: true` and a `warning` to pass on to the user.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
@@ -428,7 +509,7 @@ def send_audio_message(recipient: str, media_path: str, block: bool = False) -> 
     """
     if not recipient or not media_path:
         return {"success": False, "message": "recipient and media_path must be provided"}
-    return _result(lambda: wa.send_file(recipient, path=media_path, voice_note=True, block=block))
+    return _note_new_contact(_result(lambda: wa.send_file(recipient, path=media_path, voice_note=True, block=block)))
 
 
 @mcp.tool()

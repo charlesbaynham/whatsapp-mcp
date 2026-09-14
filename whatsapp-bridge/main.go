@@ -335,6 +335,16 @@ type SendMessageResponse struct {
 	// the message was accepted but not yet sent, which is the default.
 	ID     string `json:"id,omitempty"`
 	Queued bool   `json:"queued,omitempty"`
+	// NewContact reports that the recipient has never been messaged from this
+	// account, so the send is held in the new-contact stage — spaced by a much
+	// longer gap — before it even reaches the main queue.
+	NewContact bool `json:"new_contact,omitempty"`
+	// Ahead is how many sends were queued in front of this one (on the main
+	// queue, or among the new contacts held when NewContact is set), and
+	// EstimatedWaitSeconds a rough expectation of when it goes out, from the
+	// gates' means and the backlog at submission.
+	Ahead                int `json:"ahead,omitempty"`
+	EstimatedWaitSeconds int `json:"estimated_wait_seconds,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -353,6 +363,16 @@ type SendMessageRequest struct {
 	uploadName string
 }
 
+// parseRecipient turns the recipient string /api/send accepts — a bare phone
+// number, or a full JID for a group, newsletter or LID-addressed chat — into
+// the JID to send to.
+func parseRecipient(recipient string) (types.JID, error) {
+	if strings.Contains(recipient, "@") {
+		return types.ParseJID(recipient)
+	}
+	return types.JID{User: recipient, Server: types.DefaultUserServer}, nil
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath string, voiceNote bool, logger waLog.Logger) (bool, string) {
 	return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, recipient, message, mediaPath, "", voiceNote, logger)
@@ -364,25 +384,9 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 		return false, "Not connected to WhatsApp"
 	}
 
-	// Create JID for recipient
-	var recipientJID types.JID
-	var err error
-
-	// Check if recipient is a JID
-	isJID := strings.Contains(recipient, "@")
-
-	if isJID {
-		// Parse the JID string
-		recipientJID, err = types.ParseJID(recipient)
-		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
-		}
-	} else {
-		// Create JID from phone number
-		recipientJID = types.JID{
-			User:   recipient,
-			Server: "s.whatsapp.net", // For personal chats
-		}
+	recipientJID, err := parseRecipient(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
 	}
 
 	// Captured before verifyRecipientRegistered's own canonicalisation, to
@@ -970,6 +974,9 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 	queue := newSendQueue(newSendGateFromEnv(), func(ctx context.Context, req SendMessageRequest) (bool, string) {
 		return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, logger)
 	})
+	queue.newContacts = newNewContactStage(newNewContactGateFromEnv(), func(recipient string) bool {
+		return isNewContact(messageStore, recipient)
+	}, reachoutLock.activeNow)
 	go queue.run(queueCtx)
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)
@@ -991,6 +998,7 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 			"jid":               jid,
 			"nct_salt":          nctSalt,
 			"reachout_timelock": reachoutLock.state(),
+			"send_queue":        queue.status(),
 		})
 	})
 

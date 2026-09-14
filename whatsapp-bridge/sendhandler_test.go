@@ -224,3 +224,35 @@ func TestFullQueueRefusesAndRemovesTheUpload(t *testing.T) {
 		t.Fatalf("%d uploads on disk for %d accepted sends; a refused request left its own behind", len(entries), accepted)
 	}
 }
+
+func TestFirstContactSendIsCalledOutInTheResponse(t *testing.T) {
+	q := newSendQueue(newTestGate(0), func(context.Context, SendMessageRequest) (bool, string) { return true, "sent" })
+	q.newContacts = newNewContactStage(newTestGate(30*time.Minute), func(string) bool { return true },
+		func() (bool, time.Time) { return false, time.Time{} })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go q.run(ctx)
+
+	var last SendMessageResponse
+	for _, recipient := range []string{"447700900000", "447700900001"} {
+		body := strings.NewReader(`{"recipient":"` + recipient + `","message":"hi"}`)
+		r := httptest.NewRequest("POST", "/api/send", body)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		sendHandler(q, t.TempDir(), alwaysReady, false)(w, r)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &last); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first went straight out and claimed the gate's next slot; the
+	// second is told to expect that slot, however the draw fell.
+	if !last.NewContact || last.EstimatedWaitSeconds < 1 || last.EstimatedWaitSeconds > gapMeanCeiling*30*60 {
+		t.Fatalf("response = %+v, want a new contact held until the gate's next slot", last)
+	}
+	if !strings.Contains(last.Message, "First contact") {
+		t.Fatalf("message %q does not warn about the hold", last.Message)
+	}
+}
