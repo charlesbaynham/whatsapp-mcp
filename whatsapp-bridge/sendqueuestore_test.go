@@ -423,3 +423,30 @@ func TestQueuedMessageMentionsRestartWording(t *testing.T) {
 		t.Fatalf("stillQueued message = %q, wants to mention a restart", res.Message)
 	}
 }
+
+func TestReleasedButUnsentFirstContactStaysReleasedAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	q := persistentTestQueue(t, dir, newTestGate(time.Hour), newTestGate(time.Hour), nil)
+
+	// The stage released this first contact onto the main queue (its row is
+	// stage=main, new_contact=1) and the bridge stopped before it was sent.
+	job := &sendJob{id: "snd-released", req: SendMessageRequest{Recipient: "447700900000", Message: "hi"}}
+	if err := q.store.insertJob(job, true, stageMain, time.Now().Add(time.Minute), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	q2, recovered := reopen(t, dir, newTestGate(time.Hour), newTestGate(time.Hour), nil)
+	if recovered != 1 || q2.main.depth() != 1 {
+		t.Fatalf("recovered %d, main depth %d; want the released send back on the main queue", recovered, q2.main.depth())
+	}
+	if q2.newContacts.holds("447700900000") {
+		t.Fatal("a first contact already released before the restart is being held again")
+	}
+	_, pos, ok := q2.submit(SendMessageRequest{Recipient: "447700900000", Message: "follow-up"}, func() {})
+	if !ok || pos.newContact {
+		t.Fatalf("follow-up position = %+v ok=%v; want it straight onto the main queue behind the released send", pos, ok)
+	}
+	if q2.main.depth() != 2 || q2.newContacts.stage.depth() != 0 {
+		t.Fatalf("main depth %d, stage depth %d; want both sends on the main queue", q2.main.depth(), q2.newContacts.stage.depth())
+	}
+}

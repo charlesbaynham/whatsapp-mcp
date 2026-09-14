@@ -379,6 +379,15 @@ func (q *sendQueue) attachStore(store *sendQueueStore) (recovered int, err error
 	referenced := map[string]bool{}
 	for _, r := range mainRows {
 		q.loadRecoveredRow(q.main, r, referenced)
+		// A first contact the stage had already released but that has not
+		// gone out yet has no chat in the store, so holds() would still call
+		// the recipient new: remember the release, or a follow-up submitted
+		// before it leaves would be held for a whole gap of its own.
+		if r.NewContact && q.newContacts != nil {
+			if key, ok := contactKey(r.Recipient); ok {
+				q.newContacts.markReleased(key)
+			}
+		}
 	}
 	recovered += len(mainRows)
 
