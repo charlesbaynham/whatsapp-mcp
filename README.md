@@ -159,7 +159,10 @@ active, releases also wait for it to end rather than going out to fail.
 
 The `202` for such a send says so — `new_contact: true`, the number of new
 contacts `ahead` of it and a rough `estimated_wait_seconds` — and `GET
-/api/send/{id}` carries `new_contact` too. `GET /api/status` reports
+/api/send/{id}` carries `new_contact` too. A **blocking** send (`block: true`)
+to a new contact is refused with `422` and nothing queued: it would hold the
+request open for hours, every client would time out first, and a timeout reads
+as the bridge having died. Resubmit it asynchronously if it really is wanted. `GET /api/status` reports
 `send_queue: {pending, new_contacts_held}`. The MCP tools pass this on as a
 `warning` telling the agent to let the user know the message will go out later.
 
