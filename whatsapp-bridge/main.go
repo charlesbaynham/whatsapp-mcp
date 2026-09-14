@@ -385,6 +385,13 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 		}
 	}
 
+	// Before the first ever message to someone, confirm the number is really on
+	// WhatsApp. An undeliverable first-contact attempt still counts against
+	// WhatsApp's reach-out limit, so a bad number is much cheaper caught here.
+	if err := verifyRecipientRegistered(ctx, client, messageStore, recipientJID); err != nil {
+		return false, fmt.Sprintf("Refusing to send: %v", err)
+	}
+
 	msg := &waProto.Message{}
 
 	// Check if we have media to send
