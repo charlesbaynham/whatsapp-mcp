@@ -98,7 +98,7 @@ own user, admitted to the socket by group membership and nothing else.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `WHATSAPP_STORE_DIR` | `store` | Directory for `whatsapp.db`, `messages.db` and downloaded media |
+| `WHATSAPP_STORE_DIR` | `store` | Directory for `whatsapp.db`, `messages.db`, `sendqueue.db` (the outbound send queue's own journal — see "Outbound rate limiting" below) and downloaded media |
 | `WHATSAPP_BRIDGE_ADDR` | `127.0.0.1:8080` | Listen address: a TCP `host:port`, or `unix:/path/to.sock` (mode 0660) |
 | `WHATSAPP_BRIDGE_SOCKET_GROUP` | unset | With a Unix socket, chgrp it to this group so clients are admitted by membership |
 | `WHATSAPP_LOG_MESSAGE_BODIES` | unset | Set to `1` to log message content to stdout; by default only metadata (timestamp, direction, chat, media type) is logged |
@@ -119,8 +119,9 @@ Poisson process, so the traffic has the shape of someone typing rather than of a
 metronome. Most gaps land under the mean, the occasional one is much longer.
 
 `GET /api/send/{id}` reports how a submission went: `state` is `queued`, `sent`
-or `failed`, with the bridge's own reason on a failure. Only recent sends are
-kept, so an unknown id has aged out rather than failed.
+or `failed`, with the bridge's own reason on a failure. Finished sends are kept
+for a bounded time (the newest 500, or seven days, whichever is smaller), so an
+unknown id has aged out rather than failed.
 
 Pass `block: true` to wait for the message to actually leave and get the send's
 real outcome instead. The wait is the rate limit's, so it can run to minutes. A
@@ -170,12 +171,20 @@ submission stops at the first refusal rather than leaving a gap mid-conversation
 — the messages already queued still go out, and the rest are reported back as
 not submitted.
 
-⚠️ **The queue is in memory.** A restart or redeploy fails everything still
-waiting, naming each one in the log, and the `id`s of earlier sends are gone
-with it. Since a queued message can sit for minutes, a deploy mid-queue does
-lose messages — deliberately, because a message sent an hour late is usually
-worse than one not sent, but it is worth knowing before batching anything
-important.
+**The queue survives a restart or redeploy.** Every submission is written to
+`sendqueue.db` in the store directory before the `202` is answered, and updated
+once it finishes; on the bridge's cattle-container deploys the store directory
+is on the persistent volume, so a redeploy mid-queue does not abandon what was
+still waiting. On start the bridge reloads every submission still `queued`, in
+the order they arrived, and puts each back where it was — through the
+new-contact stage first if it is (still) a first contact, or straight onto the
+main queue otherwise — so a batch of held new contacts resumes with its
+spacing intact rather than all leaving the moment the bridge comes back.
+Stopping the bridge while a caller is blocked on `block: true` answers them
+with the send still `queued`, not a failure: the message has not gone
+anywhere, and picks up again on the next start. If the queue's database itself
+cannot be opened, the bridge logs it loudly and falls back to the old
+memory-only behaviour rather than refusing to serve sends at all.
 
 ⚠️ **This changed the default.** Before, `POST /api/send` sent synchronously and
 its `success` was the send's own. It now reports only that the message was

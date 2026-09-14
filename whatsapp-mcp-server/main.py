@@ -497,8 +497,10 @@ def get_send_status(send_id: str) -> Dict[str, Any]:
     `message` carries the bridge's own reason on a failure. `new_contact: true`
     marks a first contact, which waits in the bridge's separate new-contact
     queue (spaced about 30 minutes apart on average) before the normal one, so
-    "queued" can last hours for those. Only recent sends are kept, so an
-    unknown id means it has aged out, not that it failed.
+    "queued" can last hours for those. The queue is durable — a bridge restart
+    resumes a submission still queued, spacing intact, rather than losing it —
+    but finished sends are kept only for a bounded time (the newest 500, or a
+    week), so an unknown id means it has aged out, not that it failed.
 
     Args:
         send_id: The id returned by send_message, send_file or send_audio_message
