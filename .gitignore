@@ -5,3 +5,4 @@ result
 result-*
 .venv/
 __pycache__/
+whatsapp-bridge/whatsapp-client
