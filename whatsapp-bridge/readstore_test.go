@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 // Fixture ported from the Python server's test_unread.py:
@@ -270,5 +273,64 @@ func TestReadRoutes(t *testing.T) {
 	resp, _ := http.Post(srv.URL+"/api/chats", "application/json", nil)
 	if resp.StatusCode != 405 {
 		t.Errorf("POST /api/chats = %d, want 405", resp.StatusCode)
+	}
+}
+
+type fakeContacts map[string]types.ContactInfo
+
+func (f fakeContacts) GetContact(_ context.Context, jid types.JID) (types.ContactInfo, error) {
+	info, ok := f[jid.String()]
+	info.Found = ok
+	return info, nil
+}
+
+func TestSenderNamerUsesContactsAndNeverAGroupTheSenderCreated(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	// The failure this guards: an old-style group JID carries its creator's
+	// number, and a substring match on the number named the sender after
+	// the group ("Euro 2024 Sweepstake: Power couple").
+	if err := store.StoreChat("447700900555-1600000000@g.us", "Euro 2024 Sweepstake", now); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.newSenderNamer().name("447700900555", false); got != "447700900555" {
+		t.Errorf("no contact, no 1:1 chat: name = %q, want the bare number", got)
+	}
+
+	store.contacts = fakeContacts{
+		"447700900555@s.whatsapp.net": {PushName: "Parav"},
+		"447700900666@s.whatsapp.net": {FullName: "Gaby Espinoza", PushName: "gaby"},
+		"98765@lid":                   {PushName: "Lidia"},
+	}
+	namer := store.newSenderNamer()
+	for sender, want := range map[string]string{
+		"447700900555":                "Parav",         // push name is all we know
+		"447700900666":                "Gaby Espinoza", // address book beats push name
+		"447700900666@s.whatsapp.net": "Gaby Espinoza", // a full JID resolves too
+		"98765":                       "Lidia",         // a LID user, unresolved to a phone number
+		"447700900777":                "447700900777",  // unknown
+	} {
+		if got := namer.name(sender, false); got != want {
+			t.Errorf("name(%q) = %q, want %q", sender, got, want)
+		}
+	}
+	if got := namer.name("447700900555", true); got != "Me" {
+		t.Errorf("from me: %q", got)
+	}
+
+	// Without a contact, the sender's own 1:1 chat row names them, unless
+	// its name is just the number again.
+	if err := store.StoreChat("447700900777@s.whatsapp.net", "Steph", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StoreChat("447700900888@s.whatsapp.net", "447700900888", now); err != nil {
+		t.Fatal(err)
+	}
+	namer = store.newSenderNamer()
+	if got := namer.name("447700900777", false); got != "Steph" {
+		t.Errorf("1:1 chat row: %q", got)
+	}
+	if got := namer.name("447700900888", false); got != "447700900888" {
+		t.Errorf("number-named chat row: %q", got)
 	}
 }

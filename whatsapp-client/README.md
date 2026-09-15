@@ -26,7 +26,9 @@ and giving up on the wait loses only the outcome, not the message.
 
 A **first contact** — someone the bridge has never had a chat with — is held
 much longer, in a separate queue spaced about 30 minutes apart on average; the
-reply then has `new_contact: True` and an `estimated_wait_seconds`.
+reply then has `new_contact: True` and an `estimated_wait_seconds`. A
+`block=True` send to such a recipient is refused (`BridgeError`, status 422)
+rather than held for hours; resubmit it without `block`.
 
 `send_poll(recipient, question, options, selectable_count=1)` sends a poll;
 `get_poll(chat_jid, message_id)` reads its outcome back (tally per option and

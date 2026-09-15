@@ -54,6 +54,9 @@ type Message struct {
 type MessageStore struct {
 	db       *sql.DB
 	StoreDir string
+	// contacts names senders the read side has no chat row for (group
+	// members, say); nil until the WhatsApp client exists.
+	contacts contactLookup
 }
 
 // Initialize message store
@@ -1376,6 +1379,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer messageStore.Close()
+	messageStore.contacts = client.Store.Contacts
 
 	// Every publishable event goes through pub: into the event log, out to
 	// SSE subscribers, and (new messages only) to subscribed webhooks.
@@ -1519,10 +1523,12 @@ func main() {
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	ctx := context.Background()
 
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a name. A name
+	// that is just the number was a fallback, not a name: resolve again, so
+	// the row picks up a real one once the contact store has it.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && existingName != "" && existingName != jid.User {
 		// Chat exists with a name, use that
 		logger.Debugf("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1582,10 +1588,10 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Address-book name, else the name they chose for themselves
 		contact, err := client.Store.Contacts.GetContact(ctx, jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		if err == nil && contactDisplayName(contact) != "" {
+			name = contactDisplayName(contact)
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender

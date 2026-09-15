@@ -206,6 +206,18 @@ func (q *sendQueue) estimateWait(newContact bool, dueAt time.Time) time.Duration
 	return wait
 }
 
+// preview reports, without queueing anything, whether a send to recipient
+// would be held as a new contact and roughly how long it would wait: the
+// same backlog-based estimate submit would book it at if called now, for a
+// caller (the blocking-send refusal) that must not actually book anything
+// just to find out.
+func (q *sendQueue) preview(recipient string) (newContact bool, wait time.Duration) {
+	if q.newContacts == nil || !q.newContacts.holds(recipient) {
+		return false, 0
+	}
+	return true, q.newContacts.stage.backlogEstimate() + q.main.backlogEstimate()
+}
+
 // waitFrom is how far off an instant is, or zero once it has passed.
 func waitFrom(t time.Time) time.Duration {
 	if d := time.Until(t); d > 0 {

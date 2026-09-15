@@ -11,12 +11,23 @@ the conversation around them. A document grows for as long as the chat does;
 append costs the new chunk, not the document, so there is no reason to close
 one. Losing the state opens a fresh document per chat and carries on.
 
+Every transcript line names its speaker as the sender's phone number followed
+by their name in quotes when the bridge knows one (`447700900123 "Parav
+Pandya"`), so the extractor can tell people apart even when two share a name
+or one has none; the account owner is named as FORWARDER_OWNER_NAME alone.
+
+`python -m hindsight_forwarder.main reingest [--dry-run]` deletes this
+account's WhatsApp documents from the bank and resets the state so the next
+run replays the bridge's event log from the beginning. Stop the forwarder
+first: a running one would keep appending to documents that no longer exist.
+
 Configuration (environment):
   WHATSAPP_BRIDGE_URL      unix:/run/whatsapp/bridge.sock or http://host:port
   HINDSIGHT_URL            Hindsight API base URL, e.g. https://api.hindsight.vectorize.io
   HINDSIGHT_API_KEY        Bearer token (optional for an unauthenticated local instance)
   HINDSIGHT_BANK           Memory bank id (default: whatsapp)
   HINDSIGHT_RETAIN_PATH    Path template (default: /v1/default/banks/{bank}/memories)
+  HINDSIGHT_DOCUMENTS_PATH Path template (default: /v1/default/banks/{bank}/documents)
   HINDSIGHT_CONTEXT_EXTRA  Sentence appended to every generated context
   FORWARDER_OWNER_NAME     How the account owner is named in transcripts (default: Me)
   FORWARDER_ACCOUNT_LABEL  Which WhatsApp account this is, named in the context
@@ -40,7 +51,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
+from urllib.parse import quote
 
 import httpx
 
@@ -55,6 +67,7 @@ class Config:
     api_key: str = ""
     bank: str = "whatsapp"
     retain_path: str = "/v1/default/banks/{bank}/memories"
+    documents_path: str = "/v1/default/banks/{bank}/documents"
     context_extra: str = ""
     owner_name: str = "Me"
     account_label: str = ""
@@ -72,6 +85,7 @@ class Config:
             api_key=env.get("HINDSIGHT_API_KEY", ""),
             bank=env.get("HINDSIGHT_BANK", "whatsapp"),
             retain_path=env.get("HINDSIGHT_RETAIN_PATH", "/v1/default/banks/{bank}/memories"),
+            documents_path=env.get("HINDSIGHT_DOCUMENTS_PATH", "/v1/default/banks/{bank}/documents"),
             context_extra=env.get("HINDSIGHT_CONTEXT_EXTRA", "").strip(),
             owner_name=env.get("FORWARDER_OWNER_NAME", "Me").strip() or "Me",
             account_label=env.get("FORWARDER_ACCOUNT_LABEL", "").strip(),
@@ -85,6 +99,10 @@ class Config:
     @property
     def retain_url(self) -> str:
         return self.hindsight_url + self.retain_path.format(bank=self.bank)
+
+    @property
+    def documents_url(self) -> str:
+        return self.hindsight_url + self.documents_path.format(bank=self.bank)
 
     def tags_for(self, chat_jid: str) -> List[str]:
         """Every memory says where it came from, at three widths.
@@ -154,9 +172,20 @@ def wants(cfg: Config, ev: Event) -> bool:
 
 
 def speaker(cfg: Config, msg: Dict[str, Any]) -> str:
+    """Who said it: the owner by name; anyone else as `number "Name"`.
+
+    The number is the stable identity (two contacts can share a name, and a
+    name can change or be unknown); the quoted name is what the extractor
+    should call them. The bridge sends sender_name equal to sender when it
+    knows no name, so that case degrades to the bare number.
+    """
     if msg.get("is_from_me"):
         return cfg.owner_name
-    return msg.get("sender_name") or msg.get("sender") or "unknown"
+    sender = str(msg.get("sender") or "").strip()
+    name = str(msg.get("sender_name") or "").strip()
+    if name and name != sender:
+        return f'{sender} "{name}"' if sender else name
+    return sender or "unknown"
 
 
 def describe_poll_results(results: Any, total_voters: Any) -> str:
@@ -220,7 +249,9 @@ def describe(cfg: Config, msg: Dict[str, Any]) -> str:
         where = f"WhatsApp conversation{account} between {cfg.owner_name} and {other}"
     parts = [
         f"{where}.",
-        f'Each line is "[date time] Speaker: message"; "{cfg.owner_name}" is the owner of this WhatsApp account.',
+        'Each line is "[date time] Speaker: message". A speaker is the sender\'s phone number followed by '
+        'their name in quotes when it is known, e.g. 447700900123 "Parav Pandya", or the bare number when it is not; '
+        f'"{cfg.owner_name}" is the owner of this WhatsApp account.',
         "Voice notes appear as their transcript; other attachments appear as a bracketed note. "
         "A poll appears as its question and options, and each vote as a line saying who chose what.",
     ]
@@ -281,12 +312,31 @@ class Hindsight:
     def __init__(self, cfg: Config, transport: Optional[httpx.BaseTransport] = None):
         headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
         self.url = cfg.retain_url
+        self.documents_url = cfg.documents_url
         self._http = httpx.Client(headers=headers, timeout=60.0, transport=transport)
 
     def retain(self, items: List[Dict[str, Any]]) -> None:
         resp = self._http.post(self.url, json={"items": items})
         if resp.status_code >= 300:
             raise RuntimeError(f"Hindsight retain failed: HTTP {resp.status_code} {resp.text[:300]}")
+
+    def list_documents(self, q: str, page_size: int = 100) -> Iterator[Dict[str, Any]]:
+        """Every document whose id contains q, walking the offset pagination."""
+        offset = 0
+        while True:
+            resp = self._http.get(self.documents_url, params={"q": q, "limit": page_size, "offset": offset})
+            if resp.status_code >= 300:
+                raise RuntimeError(f"Hindsight list documents failed: HTTP {resp.status_code} {resp.text[:300]}")
+            items = resp.json().get("items") or []
+            yield from items
+            offset += len(items)
+            if len(items) < page_size:
+                return
+
+    def delete_document(self, document_id: str) -> None:
+        resp = self._http.delete(f"{self.documents_url}/{quote(document_id, safe='')}")
+        if resp.status_code >= 300 and resp.status_code != 404:
+            raise RuntimeError(f"Hindsight delete document failed: HTTP {resp.status_code} {resp.text[:300]}")
 
 
 def retain_with_retry(hs: Hindsight, items: List[Dict[str, Any]], *, sleep=time.sleep, max_delay: float = 300.0) -> None:
@@ -309,6 +359,51 @@ def forward(cfg: Config, hs: Hindsight, state: State, ev: Event) -> None:
     log.info("retained event %d into %s", ev.id, document)
 
 
+def owns_document(cfg: Config, doc: Dict[str, Any]) -> bool:
+    """Whether this forwarder wrote doc: a WhatsApp document from this account.
+
+    Two bridges can share a bank (metadata.account tells them apart), and a
+    bank can hold documents from other sources entirely; neither is ours to
+    delete. A forwarder with no account configured owns every WhatsApp
+    document, which is what its own writes were tagged as.
+    """
+    if not str(doc.get("id") or "").startswith("whatsapp:"):
+        return False
+    meta = doc.get("document_metadata") or doc.get("metadata") or {}
+    if meta.get("source", "whatsapp") != "whatsapp":
+        return False
+    return not cfg.account or meta.get("account") == cfg.account
+
+
+def reingest(cfg: Config, hs: Hindsight, state: State, *, dry_run: bool = False) -> List[str]:
+    """Delete this account's documents and rewind, so the next run rebuilds them.
+
+    The bridge's event log is the source of truth and is never pruned, so
+    replaying it from event 0 recreates every document with whatever the
+    forwarder now renders (sender names, say). Each chat opens a fresh
+    document id, which is why the old ones must go first: they would
+    otherwise linger as duplicates.
+
+    Must run with the forwarder stopped, since a running one would carry on
+    appending to the documents this deletes.
+    """
+    mine = sorted(str(d["id"]) for d in hs.list_documents("whatsapp:") if owns_document(cfg, d))
+    for document in mine:
+        if dry_run:
+            log.info("would delete %s", document)
+            continue
+        hs.delete_document(document)
+        log.info("deleted %s", document)
+    if dry_run:
+        log.info("dry run: %d documents would be deleted and the cursor reset from %d", len(mine), state.cursor)
+        return mine
+    state.cursor = 0
+    state.documents = {}
+    state.save()
+    log.info("deleted %d documents; state reset, next run replays the event log from the start", len(mine))
+    return mine
+
+
 def run(cfg: Config, wa: WhatsAppClient, hs: Hindsight, state: State, *, events: Optional[Iterable[Event]] = None) -> None:
     log.info("forwarding from event %d to %s (chats: %s)", state.cursor, hs.url, ", ".join(sorted(cfg.chats)) or "all")
     stream = events if events is not None else wa.events(
@@ -320,9 +415,19 @@ def run(cfg: Config, wa: WhatsAppClient, hs: Hindsight, state: State, *, events:
         state.save()
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    args = sys.argv[1:] if argv is None else argv
     cfg = Config.from_env(dict(os.environ))
+    if args and args[0] == "reingest":
+        if not cfg.hindsight_url:
+            log.error("HINDSIGHT_URL is not set")
+            raise SystemExit(1)
+        reingest(cfg, Hindsight(cfg), State(cfg.state_dir / "state.json"), dry_run="--dry-run" in args[1:])
+        return
+    if args:
+        log.error("unknown arguments %s (usage: hindsight_forwarder.main [reingest [--dry-run]])", args)
+        raise SystemExit(2)
     if not cfg.hindsight_url:
         log.warning("HINDSIGHT_URL is not set; idling instead of forwarding")
         signal.pause()

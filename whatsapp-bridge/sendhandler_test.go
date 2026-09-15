@@ -256,3 +256,56 @@ func TestFirstContactSendIsCalledOutInTheResponse(t *testing.T) {
 		t.Fatalf("message %q does not warn about the hold", last.Message)
 	}
 }
+
+func TestBlockingSendToAFirstContactIsRefused(t *testing.T) {
+	var rec recorder
+	q := newSendQueue(newTestGate(0), rec.send)
+	chats := fakeChats{known: map[string]bool{"447700900001@s.whatsapp.net": true}}
+	q.newContacts = newNewContactStage(newTestGate(30*time.Minute), func(r string) bool { return isNewContact(chats, r) },
+		func() (bool, time.Time) { return false, time.Time{} })
+	// No worker yet, so the first contact submitted below stays held and the
+	// refusal's estimate is exactly one mean gap rather than whatever the
+	// stage happened to draw if it had already released it.
+	post := func(body string) (*httptest.ResponseRecorder, SendMessageResponse) {
+		r := httptest.NewRequest("POST", "/api/send", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		sendHandler(q, t.TempDir(), alwaysReady, false)(w, r)
+		var res SendMessageResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+			t.Fatalf("%d %s: %v", w.Code, w.Body.String(), err)
+		}
+		return w, res
+	}
+
+	// Hold one first contact so the next would be a gap out, then block on it.
+	_, _ = post(`{"recipient":"447700900000","message":"hi"}`)
+	before := q.pending()
+	w, res := post(`{"recipient":"447700900002","message":"hi","block":true}`)
+	if w.Code != http.StatusUnprocessableEntity || res.Success || !res.NewContact {
+		t.Fatalf("blocking first contact: %d %+v, want a refusal", w.Code, res)
+	}
+	if res.EstimatedWaitSeconds != 30*60 {
+		t.Fatalf("estimate = %ds, want the one mean gap it would have waited", res.EstimatedWaitSeconds)
+	}
+	for _, want := range []string{"447700900002", "never been messaged", "Nothing was queued", "resubmit it without block"} {
+		if !strings.Contains(res.Message, want) {
+			t.Fatalf("%q lacks %q", res.Message, want)
+		}
+	}
+	if got := q.pending(); got != before {
+		t.Fatalf("pending = %d after the refusal, want %d: the refused send must not have been queued", got, before)
+	}
+
+	// The same recipient without block is queued as usual, and a blocking send
+	// into an established chat still blocks and returns the outcome.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go q.run(ctx)
+	if w, res := post(`{"recipient":"447700900002","message":"hi"}`); w.Code != http.StatusAccepted || !res.NewContact {
+		t.Fatalf("async first contact: %d %+v", w.Code, res)
+	}
+	if w, res := post(`{"recipient":"447700900001","message":"hi","block":true}`); w.Code != http.StatusOK || !res.Success {
+		t.Fatalf("blocking established chat: %d %+v", w.Code, res)
+	}
+}

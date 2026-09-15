@@ -277,7 +277,9 @@ def send_message(
         block: Wait for the message to actually leave and return the send's own
                  outcome instead of queueing (default False). The wait is the rate
                  limit's and can run to minutes, so only pass True when the
-                 outcome must be known before doing anything else.
+                 outcome must be known before doing anything else. Refused
+                 outright for a first contact (the wait would be hours):
+                 resubmit without block and poll get_send_status instead.
 
     Returns:
         A dictionary containing success status, a status message, and the
@@ -569,7 +571,9 @@ def send_file(recipient: str, media_path: str, block: bool = False) -> Dict[str,
         block: Wait for the message to actually leave and return the send's own
                  outcome instead of queueing (default False). The wait is the rate
                  limit's and can run to minutes, so only pass True when the
-                 outcome must be known before doing anything else.
+                 outcome must be known before doing anything else. Refused
+                 outright for a first contact (the wait would be hours):
+                 resubmit without block and poll get_send_status instead.
 
     Returns:
         A dictionary containing success status, a status message, and the
@@ -600,7 +604,9 @@ def send_audio_message(recipient: str, media_path: str, block: bool = False) -> 
         block: Wait for the message to actually leave and return the send's own
                  outcome instead of queueing (default False). The wait is the rate
                  limit's and can run to minutes, so only pass True when the
-                 outcome must be known before doing anything else.
+                 outcome must be known before doing anything else. Refused
+                 outright for a first contact (the wait would be hours):
+                 resubmit without block and poll get_send_status instead.
 
     Returns:
         A dictionary containing success status, a status message, and the
