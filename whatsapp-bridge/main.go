@@ -1029,6 +1029,13 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 	queue.newContacts = newNewContactStage(newNewContactGateFromEnv(), func(recipient string) bool {
 		return isNewContact(messageStore, recipient)
 	}, reachoutLock.activeNow)
+	if store, err := openSendQueueStore(messageStore.StoreDir); err != nil {
+		logger.Errorf("Send queue: could not open the durable queue store, falling back to memory-only (nothing will survive a restart): %v", err)
+	} else if recovered, err := queue.attachStore(store); err != nil {
+		logger.Errorf("Send queue: could not recover previously queued submissions, continuing memory-only from here: %v", err)
+	} else if recovered > 0 {
+		logger.Infof("Send queue: recovered %d submission(s) queued before the last restart", recovered)
+	}
 	go queue.run(queueCtx)
 
 	registerWebhookRoutes(mux, messageStore, dispatcher, logger)

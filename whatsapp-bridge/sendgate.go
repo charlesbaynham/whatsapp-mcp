@@ -4,7 +4,6 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 )
 
@@ -29,16 +28,16 @@ const (
 	minNewContactGap         = 1 * time.Minute
 )
 
-// sendGate spaces sends by Exponential(1/mean). Each gate is driven by one
-// worker goroutine; the lock is only so that submissions on other goroutines
-// can peek at the next slot to estimate a wait.
+// sendGate is the exponential draw a scheduledQueue uses to space its sends:
+// Exponential(1/mean), clamped at both ends. It carries no state of its own
+// beyond the RNG — the "when did the last one leave" bookkeeping now lives on
+// scheduledQueue (as lastDue), because that is what gets persisted and
+// recovered across a restart; the gate is just where the randomness comes
+// from.
 type sendGate struct {
 	rand  *rand.Rand
 	mean  time.Duration
 	floor time.Duration // shortest gap a draw can produce
-
-	mu   sync.Mutex
-	next time.Time // earliest instant the next send may leave
 }
 
 func newSendGate(mean, floor time.Duration) *sendGate {
@@ -96,31 +95,4 @@ func (g *sendGate) draw() time.Duration {
 		return ceiling
 	}
 	return d
-}
-
-// due returns the instant this send may go out, and records the gap before the
-// one after it. An idle gate is due immediately.
-func (g *sendGate) due(now time.Time) time.Time {
-	if !g.enabled() {
-		return now
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	slot := g.next
-	if slot.Before(now) {
-		slot = now
-	}
-	g.next = slot.Add(g.draw())
-	return slot
-}
-
-// peek is the earliest instant the next send may leave, without claiming it.
-// Zero, or in the past, for an idle gate.
-func (g *sendGate) peek() time.Time {
-	if !g.enabled() {
-		return time.Time{}
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.next
 }

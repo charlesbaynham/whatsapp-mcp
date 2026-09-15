@@ -19,14 +19,6 @@ func drawN(g *sendGate, n int) []time.Duration {
 	return out
 }
 
-func TestFirstSendIsDueImmediately(t *testing.T) {
-	g := newTestGate(30 * time.Second)
-	now := time.Now()
-	if due := g.due(now); due.After(now) {
-		t.Fatalf("idle gate held the first send back by %s", due.Sub(now))
-	}
-}
-
 func TestGapMeanMatchesConfiguredMean(t *testing.T) {
 	mean := 30 * time.Second
 	got := meanSeconds(drawN(newTestGate(mean), 50000))
@@ -75,29 +67,6 @@ func TestGapIsNotConstant(t *testing.T) {
 		}
 	}
 	t.Fatal("every gap came out identical; a fixed interval is as machine-like as none")
-}
-
-func TestSuccessiveSlotsAreSpacedByTheGap(t *testing.T) {
-	g := newTestGate(30 * time.Second)
-	now := time.Now()
-	prev := g.due(now)
-	for i := 0; i < 100; i++ {
-		slot := g.due(now)
-		if gap := slot.Sub(prev); gap < minGap {
-			t.Fatalf("slots %d and %d are %s apart, below the %s floor", i, i+1, gap, minGap)
-		}
-		prev = slot
-	}
-}
-
-func TestDisabledGateIsAlwaysDueNow(t *testing.T) {
-	g := newTestGate(0)
-	now := time.Now()
-	for i := 0; i < 5; i++ {
-		if due := g.due(now); due.After(now) {
-			t.Fatalf("disabled gate held a send back by %s", due.Sub(now))
-		}
-	}
 }
 
 func TestEnvDurationSeconds(t *testing.T) {
