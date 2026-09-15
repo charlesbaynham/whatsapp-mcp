@@ -27,6 +27,16 @@ that it is given everything.
   WhatsApp account between Charles and Gaby. Each line is `[date time]
   Speaker: message`…"*. `FORWARDER_OWNER_NAME` and `FORWARDER_ACCOUNT_LABEL`
   fill in the names; `HINDSIGHT_CONTEXT_EXTRA` adds a sentence of your own.
+- **A speaker is `number "Name"`**: `[2026-09-14 08:11] 447700900123 "Parav
+  Pandya": Pretty cool couple mind`. The number is the stable identity (two
+  contacts can share a name; a name can change or be unknown), the quoted
+  name is what the extractor should call them, and the owner appears as
+  `FORWARDER_OWNER_NAME` alone. The name is the bridge's `sender_name`, which
+  comes from whatsmeow's contact store: the address-book name WhatsApp
+  synced, else the push name the sender chose for themselves (the one the
+  phone shows as "~ Parav"), which every message carries, so group members
+  the owner has never chatted with 1:1 are still named. A sender nothing
+  knows a name for appears as the bare number.
 - **A document is never closed.** Append costs the new chunk, not the
   document, so a chat is one document for as long as it lasts. The id carries
   the time it was opened plus a random suffix:
@@ -56,3 +66,28 @@ deletion.
 
 A Hindsight outage is safe: the state advances only after retain returns, so
 recovery replays at most the message in flight.
+
+## Re-ingesting
+
+When the transcript format changes (as it did when speakers gained names),
+the documents already in the bank are stale, and append cannot fix a line
+that has already been extracted. `reingest` rebuilds them from the bridge's
+event log, which is never pruned:
+
+```sh
+systemctl stop whatsapp-hindsight
+# same environment the service runs with: the env file plus the state dir
+sudo -u whatsapp-hindsight env $(grep -v '^#' /data/secrets/hindsight.env | xargs) \
+  STATE_DIRECTORY=/data/clients/hindsight PYTHONPATH=<clientSource>/src:<forwarderSource>/src \
+  python -m hindsight_forwarder.main reingest --dry-run   # lists what would go
+sudo -u whatsapp-hindsight env ... python -m hindsight_forwarder.main reingest
+systemctl start whatsapp-hindsight
+```
+
+It deletes every document in the bank whose id starts with `whatsapp:` and
+whose metadata carries this forwarder's `FORWARDER_ACCOUNT` (a bank shared
+by two bridges loses only the one account's documents; other sources are
+never touched), then resets the cursor and the per-chat open documents.
+The restarted forwarder replays from event 0 and every chat opens a fresh
+document. Stop the service first: a running forwarder would keep appending
+to the documents being deleted. Run it once per bridge.

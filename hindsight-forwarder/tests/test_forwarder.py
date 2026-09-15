@@ -5,8 +5,8 @@ from pathlib import Path
 
 import httpx
 
-from hindsight_forwarder.main import (Config, Hindsight, State, describe, document_for, retain_item,
-                                      retain_with_retry, run, transcript_line, wants)
+from hindsight_forwarder.main import (Config, Hindsight, State, describe, document_for, owns_document, reingest,
+                                      retain_item, retain_with_retry, run, transcript_line, wants)
 from whatsapp_client import Event
 
 
@@ -74,8 +74,17 @@ class TranscriptTests(unittest.TestCase):
         vote["selected"] = []
         self.assertIn("Bob: withdrew their vote on the poll", transcript_line(cfg, {"sender_name": "Bob", "poll_vote": vote}))
 
+    def test_sender_is_number_and_quoted_name(self):
+        cfg = forwarding_config()
+        line = transcript_line(cfg, {"sender": "447700900123", "sender_name": "Parav Pandya", "content": "x"})
+        self.assertIn('] 447700900123 "Parav Pandya": x', line)
+
     def test_sender_falls_back_to_number(self):
-        self.assertIn("447700900123:", transcript_line(forwarding_config(), {"sender": "447700900123", "content": "x"}))
+        cfg = forwarding_config()
+        # The bridge sends sender_name == sender when it knows no name.
+        self.assertIn("] 447700900123: x", transcript_line(cfg, {"sender": "447700900123", "sender_name": "447700900123", "content": "x"}))
+        self.assertIn("] 447700900123: x", transcript_line(cfg, {"sender": "447700900123", "content": "x"}))
+        self.assertIn("] unknown: x", transcript_line(cfg, {"content": "x"}))
 
 
 class ContextTests(unittest.TestCase):
@@ -85,6 +94,7 @@ class ContextTests(unittest.TestCase):
         self.assertIn("between Charles and Gaby", ctx)
         self.assertIn("personal WhatsApp account", ctx)
         self.assertIn('"Charles" is the owner', ctx)
+        self.assertIn("phone number followed by their name in quotes", ctx)
 
     def test_group_chat_is_described_as_a_group(self):
         ctx = describe(forwarding_config(), {"chat_jid": "123@g.us", "chat_name": "Climbing trip"})
@@ -185,6 +195,51 @@ class RetainTests(unittest.TestCase):
         retain_with_retry(hs, [{"content": "x"}], sleep=slept.append)
         self.assertEqual(len(attempts), 3)
         self.assertEqual(slept, [2.0, 4.0])
+
+
+class ReingestTests(unittest.TestCase):
+    def test_owns_only_this_accounts_whatsapp_documents(self):
+        cfg = forwarding_config(account="charles-personal")
+        mine = {"id": "whatsapp:c@g.us:2026-x", "document_metadata": {"source": "whatsapp", "account": "charles-personal"}}
+        other_account = {"id": "whatsapp:c@g.us:2026-y", "document_metadata": {"source": "whatsapp", "account": "charlesbot"}}
+        other_source = {"id": "meeting:2026-09-01", "document_metadata": {"source": "granola"}}
+        self.assertTrue(owns_document(cfg, mine))
+        self.assertFalse(owns_document(cfg, other_account))
+        self.assertFalse(owns_document(cfg, other_source))
+        self.assertTrue(owns_document(forwarding_config(), other_account))
+        self.assertFalse(owns_document(forwarding_config(), other_source))
+
+    def test_deletes_pages_of_own_documents_and_rewinds_state(self):
+        docs = [{"id": f"whatsapp:{i}@g.us:2026-{i}", "document_metadata": {"source": "whatsapp", "account": "a"}} for i in range(3)]
+        docs.append({"id": "whatsapp:x@g.us:2026-x", "document_metadata": {"source": "whatsapp", "account": "b"}})
+        requests = []
+
+        def handler(r):
+            requests.append(r)
+            if r.method == "GET":
+                offset, limit = int(r.url.params["offset"]), int(r.url.params["limit"])
+                return httpx.Response(200, json={"items": docs[offset:offset + limit], "total": len(docs)})
+            return httpx.Response(200, json={"success": True})
+
+        cfg = forwarding_config(account="a", bank="b")
+        hs = Hindsight(cfg, transport=httpx.MockTransport(handler))
+        self.assertEqual([d["id"] for d in hs.list_documents("whatsapp:", page_size=2)], [d["id"] for d in docs])
+        self.assertEqual([int(r.url.params["offset"]) for r in requests], [0, 2, 4])
+        requests.clear()
+        with tempfile.TemporaryDirectory() as d:
+            state = State(Path(d) / "state.json")
+            state.cursor, state.documents = 42, {"0@g.us": docs[0]["id"]}
+            state.save()
+            self.assertEqual(reingest(cfg, hs, state, dry_run=True), [d["id"] for d in docs[:3]])
+            self.assertEqual([r.method for r in requests], ["GET"])
+            self.assertEqual(State(Path(d) / "state.json").cursor, 42)
+            requests.clear()
+            reingest(cfg, hs, state)
+            deleted = [r for r in requests if r.method == "DELETE"]
+            self.assertEqual([str(r.url) for r in deleted],
+                             [f"https://h/v1/default/banks/b/documents/whatsapp%3A{i}%40g.us%3A2026-{i}" for i in range(3)])
+            reloaded = State(Path(d) / "state.json")
+            self.assertEqual((reloaded.cursor, reloaded.documents), (0, {}))
 
 
 class RunTests(unittest.TestCase):

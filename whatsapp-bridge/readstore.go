@@ -5,11 +5,14 @@ package main
 // nothing else needs to open the database.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 const (
@@ -111,9 +114,30 @@ func scanMessageView(row interface{ Scan(dest ...any) error }) (MessageView, err
 	return v, nil
 }
 
-// senderNamer resolves sender_name the way the Python server did: "Me" for
-// our own messages, else the chat name for the sender's JID (exact, then a
-// LIKE on the bare number), else the raw sender. Cached per request.
+// contactLookup is the slice of whatsmeow's contact store the read side
+// needs; *whatsmeow.Client's Store.Contacts implements it. whatsmeow keeps
+// that store current on its own: address-book names arrive by app-state
+// sync, and the push name every incoming message carries is written as it
+// is seen, so it knows group members the owner has never chatted with 1:1.
+type contactLookup interface {
+	GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error)
+}
+
+// contactDisplayName picks the name to show for a contact: what the owner's
+// address book calls them first, then the name they chose for themselves
+// (their push name), then a verified business name. Empty if none is known.
+func contactDisplayName(info types.ContactInfo) string {
+	for _, name := range []string{info.FullName, info.FirstName, info.PushName, info.BusinessName} {
+		if name = strings.TrimSpace(name); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// senderNamer resolves sender_name: "Me" for our own messages, else the
+// contact store's name for the sender, else the name of the sender's own
+// 1:1 chat row, else the raw sender. Cached per request.
 type senderNamer struct {
 	store *MessageStore
 	cache map[string]string
@@ -144,23 +168,48 @@ func (n *senderNamer) name(sender string, isFromMe bool) string {
 	if v, ok := n.cache[sender]; ok {
 		return v
 	}
-	name := sender
-	var found sql.NullString
-	err := n.store.db.QueryRow(`SELECT name FROM chats WHERE jid = ? LIMIT 1`, sender).Scan(&found)
-	if err != nil || !found.Valid || found.String == "" {
-		phone := sender
-		if i := strings.Index(sender, "@"); i >= 0 {
-			phone = sender[:i]
-		}
-		if phone != "" {
-			err = n.store.db.QueryRow(`SELECT name FROM chats WHERE jid LIKE ? LIMIT 1`, "%"+phone+"%").Scan(&found)
-		}
-	}
-	if err == nil && found.Valid && found.String != "" {
-		name = found.String
+	name := n.lookup(sender)
+	if name == "" {
+		name = sender
 	}
 	n.cache[sender] = name
 	return name
+}
+
+// lookup resolves a sender (a bare phone number or LID, as messages.sender
+// stores it, or a full JID) to a display name, or "" if nothing knows one.
+//
+// The chat row is matched on the sender's exact 1:1 JID, never by
+// substring: an old-style group JID is "<creator's number>-<timestamp>@g.us",
+// so a LIKE on the number used to hand back the name of some group the
+// sender happened to create. A chat row whose name is just the number is
+// no name at all.
+func (n *senderNamer) lookup(sender string) string {
+	user, servers := sender, []string{types.DefaultUserServer, types.HiddenUserServer}
+	if i := strings.Index(sender, "@"); i >= 0 {
+		user, servers = sender[:i], []string{sender[i+1:]}
+	}
+	if user == "" {
+		return ""
+	}
+	ctx := context.Background()
+	for _, server := range servers {
+		jid := types.NewJID(user, server)
+		if n.store.contacts != nil {
+			if info, err := n.store.contacts.GetContact(ctx, jid); err == nil {
+				if name := contactDisplayName(info); name != "" {
+					return name
+				}
+			}
+		}
+		var found sql.NullString
+		if err := n.store.db.QueryRow(`SELECT name FROM chats WHERE jid = ?`, jid.String()).Scan(&found); err == nil && found.Valid {
+			if name := strings.TrimSpace(found.String); name != "" && name != user {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 func (n *senderNamer) fill(msgs []MessageView) {
