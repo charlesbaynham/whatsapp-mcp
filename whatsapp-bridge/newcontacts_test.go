@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -28,6 +29,26 @@ func newContactsQueue(t *testing.T, mean time.Duration, known []string, lock fun
 	t.Cleanup(cancel)
 	go q.run(ctx)
 	return q
+}
+
+// newContactsQueueUnstarted is newContactsQueue without launching the worker:
+// for a test that needs several submissions classified before any of them
+// can possibly have already been processed (an idle stage releases its first
+// job as soon as a worker goroutine gets scheduled, which can otherwise race
+// a second submission a few lines later).
+func newContactsQueueUnstarted(t *testing.T, mean time.Duration, known []string, send func(context.Context, SendMessageRequest) (bool, string)) (q *sendQueue, start func()) {
+	t.Helper()
+	q = newSendQueue(newTestGate(0), send)
+	chats := fakeChats{known: make(map[string]bool)}
+	for _, jid := range known {
+		chats.known[jid] = true
+	}
+	q.newContacts = newNewContactStage(newTestGate(mean), func(recipient string) bool {
+		return isNewContact(chats, recipient)
+	}, func() (bool, time.Time) { return false, time.Time{} })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return q, func() { go q.run(ctx) }
 }
 
 // recorder collects the recipients a queue's send function is called with.
@@ -118,7 +139,10 @@ func TestNewContactsAreSpacedByTheirOwnGate(t *testing.T) {
 // message must neither wait behind an hour of gate nor overtake the first.
 func TestFollowUpToAHeldContactLeavesWithIt(t *testing.T) {
 	var rec recorder
-	q := newContactsQueue(t, time.Hour, nil, nil, rec.send)
+	// Unstarted: with the worker already running, an idle stage can release
+	// "a" before the next line even submits "b" — submit everything the test
+	// depends on first, then let the worker loose on all of it at once.
+	q, start := newContactsQueueUnstarted(t, time.Hour, nil, rec.send)
 
 	a, _ := mustSubmit(t, q, "447700900000")
 	b, bNew := mustSubmit(t, q, "447700900000@s.whatsapp.net")
@@ -126,6 +150,7 @@ func TestFollowUpToAHeldContactLeavesWithIt(t *testing.T) {
 	if !bNew {
 		t.Fatal("a second message to a still-held first contact must queue behind it in the stage")
 	}
+	start()
 	waitFor(t, a.done)
 	waitFor(t, b.done)
 	notSentWithin(t, c, 200*time.Millisecond)
@@ -178,7 +203,7 @@ func TestReleaseAfterTheLockDoesNotBunchUp(t *testing.T) {
 	notSentWithin(t, second, 200*time.Millisecond)
 }
 
-func TestShutdownWhileHeldAsNewContactFailsTheJob(t *testing.T) {
+func TestShutdownWhileHeldAsNewContactStaysQueued(t *testing.T) {
 	var rec recorder
 	q := newSendQueue(newTestGate(0), rec.send)
 	q.newContacts = newNewContactStage(newTestGate(time.Hour), func(string) bool { return true }, func() (bool, time.Time) { return false, time.Time{} })
@@ -187,24 +212,32 @@ func TestShutdownWhileHeldAsNewContactFailsTheJob(t *testing.T) {
 
 	first, _ := mustSubmit(t, q, "447700900000")
 	waitFor(t, first.done)
-	cleaned := make(chan struct{}, 2)
-	waiting, _, _ := q.submit(SendMessageRequest{Recipient: "447700900001"}, func() { cleaned <- struct{}{} })
-	queued, _, _ := q.submit(SendMessageRequest{Recipient: "447700900002"}, func() { cleaned <- struct{}{} })
+	var cleaned int32
+	waiting, _, _ := q.submit(SendMessageRequest{Recipient: "447700900001"}, func() { atomic.AddInt32(&cleaned, 1) })
+	queued, _, _ := q.submit(SendMessageRequest{Recipient: "447700900002"}, func() { atomic.AddInt32(&cleaned, 1) })
 	time.Sleep(50 * time.Millisecond) // let the stage pick the first one up and start waiting
 	cancel()
 
+	// A restart must not fail these — they are still queued and will resume,
+	// and their (hypothetical) uploads must not be cleaned up: the row on
+	// disk stays exactly as submitted for the next start's recovery.
 	for _, job := range []*sendJob{waiting, queued} {
 		res := waitFor(t, job.done)
-		if res.Success || res.State != sendFailed || !strings.Contains(res.Message, "bridge stopped") {
-			t.Fatalf("result = %+v, want the abandonment failure", res)
+		if res.Success || res.State != sendQueued {
+			t.Fatalf("result = %+v, want still queued, not failed", res)
 		}
-		<-cleaned
+		if !strings.Contains(res.Message, "restart") {
+			t.Fatalf("message %q does not explain the send will resume after a restart", res.Message)
+		}
 	}
 	if got := rec.recipients(); len(got) != 1 {
 		t.Fatalf("sent %v, want only the one that was released before shutdown", got)
 	}
 	if q.pending() != 0 {
 		t.Fatalf("pending = %d after draining, want 0", q.pending())
+	}
+	if atomic.LoadInt32(&cleaned) != 0 {
+		t.Fatal("a job kept queued for a restart must keep its upload, not clean it up")
 	}
 }
 
@@ -304,6 +337,11 @@ func TestIsNewContact(t *testing.T) {
 	}
 }
 
+// Due times are now computed once, at submission, from the gates' draws —
+// not from a mean-based projection — and the reach-out time-lock is only
+// checked once a job's turn actually arrives (see newContactStage.makeOnDue),
+// so it plays no part in the estimate a submission is given up front. What
+// submit can promise is bounded by the gate's own clamps.
 func TestSubmissionEstimatesItsWait(t *testing.T) {
 	var rec recorder
 	q := newSendQueue(newTestGate(30*time.Second), rec.send)
@@ -316,34 +354,23 @@ func TestSubmissionEstimatesItsWait(t *testing.T) {
 	if !first.newContact || first.ahead != 0 || second.ahead != 1 {
 		t.Fatalf("positions = %+v, %+v", first, second)
 	}
-	// The first waits out the lock; the second also waits one mean gap.
-	if first.wait < 9*time.Minute || first.wait > 11*time.Minute {
-		t.Fatalf("first wait = %s, want ~10m (the rest of the lock)", first.wait)
+	// The stage is idle, so the first new contact's due time is immediate.
+	if first.wait > time.Second {
+		t.Fatalf("first wait = %s, want near-immediate (nothing else held)", first.wait)
 	}
-	if second.wait < 39*time.Minute || second.wait > 41*time.Minute {
-		t.Fatalf("second wait = %s, want ~40m (lock plus one gap)", second.wait)
+	// The second pays one new-contact gap on top of it.
+	if second.wait < minNewContactGap || second.wait > gapMeanCeiling*30*time.Minute {
+		t.Fatalf("second wait = %s, want one new-contact gap (%s..%s)", second.wait, minNewContactGap, gapMeanCeiling*30*time.Minute)
 	}
 
 	q.newContacts = nil
 	_, a, _ := q.submit(SendMessageRequest{Recipient: "447700900002"}, func() {})
 	_, b, _ := q.submit(SendMessageRequest{Recipient: "447700900003"}, func() {})
-	if a.newContact || a.wait != 0 || b.ahead != 1 || b.wait != 30*time.Second {
-		t.Fatalf("main-queue positions = %+v, %+v; want the second one mean gap out", a, b)
+	if a.newContact || a.wait > time.Second || b.ahead != 1 {
+		t.Fatalf("main-queue positions = %+v, %+v", a, b)
 	}
-}
-
-func TestEstimateStartsFromTheGatesNextSlot(t *testing.T) {
-	// A stage whose last release booked its next slot an hour out must say so
-	// to the next submission, even with nothing else waiting.
-	stage := newNewContactStage(newTestGate(time.Hour), func(string) bool { return true },
-		func() (bool, time.Time) { return false, time.Time{} })
-	stage.gate.due(time.Now()) // the idle gate lets this one go now and books the next
-	next := stage.gate.peek()
-	if got, want := stage.expectedWait(0), time.Until(next); got < want-time.Second || got > want+time.Second {
-		t.Fatalf("expectedWait(0) = %s, want ~%s (until the booked slot)", got, want)
-	}
-	if got, want := stage.expectedWait(2), time.Until(next)+2*time.Hour; got < want-time.Second || got > want+time.Second {
-		t.Fatalf("expectedWait(2) = %s, want ~%s", got, want)
+	if b.wait < minGap || b.wait > gapMeanCeiling*30*time.Second {
+		t.Fatalf("second main-queue wait = %s, want one main gap (%s..%s)", b.wait, minGap, gapMeanCeiling*30*time.Second)
 	}
 }
 
