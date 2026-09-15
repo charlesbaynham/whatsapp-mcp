@@ -48,34 +48,44 @@ type sendJob struct {
 	done    chan SendResult
 }
 
-// sendQueue serialises outbound sends through one worker, spacing them with the
-// gate. Submissions are accepted and acknowledged immediately; a caller that
-// wants the outcome waits on the returned channel instead.
+// sendQueue serialises outbound sends through the main scheduledQueue,
+// spacing them with its gate. Submissions are accepted, persisted and
+// acknowledged immediately; a caller that wants the outcome waits on the
+// returned channel instead.
 //
 // A send to someone the account has never messaged does not join the main
-// queue directly: it waits in newContacts first (see newContactStage), and is
-// handed on to jobs — subject to the ordinary gate like everything else — only
-// when that stage releases it.
+// queue directly: it waits in newContacts first (see newcontacts.go), and is
+// handed on to the main queue — subject to the ordinary gate like everything
+// else — only when that stage releases it.
+//
+// Every submission and outcome is written to store (nil disables
+// persistence, falling back to memory-only behaviour) before it is acted on,
+// so a restart can pick the queue back up where it left off; see
+// attachStore.
 type sendQueue struct {
-	jobs        chan *sendJob
-	gate        *sendGate
+	main        *scheduledQueue
 	newContacts *newContactStage // nil: first contacts are not held separately
 	send        func(ctx context.Context, req SendMessageRequest) (bool, string)
+	store       *sendQueueStore
+
+	wireOnce sync.Once
 
 	mu      sync.Mutex
 	results map[string]SendResult
 	order   []string
-	depth   int // on the main queue, the in-flight send included
-	held    int // in the new-contact stage
 }
 
 func newSendQueue(gate *sendGate, send func(context.Context, SendMessageRequest) (bool, string)) *sendQueue {
-	return &sendQueue{
-		jobs:    make(chan *sendJob, queueDepthFromEnv()),
-		gate:    gate,
+	q := &sendQueue{
 		send:    send,
 		results: make(map[string]SendResult, resultsKept),
 	}
+	q.main = newScheduledQueue(stageMain, gate, queueDepthFromEnv(), q.mainOnDue)
+	q.main.onShutdown = q.stillQueued
+	q.main.onScheduled = func(job *sendJob, queuedAt time.Time) {
+		q.record(SendResult{ID: job.id, State: sendQueued, QueuedAt: queuedAt})
+	}
+	return q
 }
 
 // queueDepthFromEnv is how many submissions a queue accepts before refusing
@@ -87,44 +97,47 @@ func queueDepthFromEnv() int {
 	return min(envPositiveInt("WHATSAPP_SEND_MAX_QUEUE_DEPTH", defaultQueueDepth), resultsKept/2)
 }
 
-// run drives the queue until ctx is cancelled: one worker goroutine for the
-// main queue and one for the new-contact stage, so sends never overlap and
-// each gate is advanced from a single place.
-func (q *sendQueue) run(ctx context.Context) {
-	if q.newContacts != nil {
-		go q.newContacts.run(ctx, q)
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			q.drain()
+// ensureWired connects the new-contact stage's callbacks to this queue. It
+// has to happen after newContacts is assigned (a plain field, set by the
+// caller after construction) but must not race a submission that arrives
+// just as run is starting, so both run and submit call it and sync.Once
+// makes whichever gets there first the one that does it.
+func (q *sendQueue) ensureWired() {
+	q.wireOnce.Do(func() {
+		if q.newContacts == nil {
 			return
-		case job := <-q.jobs:
-			q.dispatch(ctx, job)
 		}
-	}
+		nc := q.newContacts
+		nc.stage.onDue = nc.makeOnDue(q.main, q.stillQueued)
+		nc.stage.onShutdown = q.stillQueued
+		nc.stage.onScheduled = func(job *sendJob, queuedAt time.Time) {
+			q.record(SendResult{ID: job.id, State: sendQueued, NewContact: true, QueuedAt: queuedAt})
+		}
+	})
 }
 
-func (q *sendQueue) dispatch(ctx context.Context, job *sendJob) {
-	defer job.cleanup()
+// run drives the queue until ctx is cancelled: one worker for the main queue
+// and, if first contacts are held separately, one for the new-contact stage,
+// so sends never overlap and each stage's gate is advanced from a single
+// place.
+func (q *sendQueue) run(ctx context.Context) {
+	q.ensureWired()
+	if q.newContacts != nil {
+		go q.newContacts.stage.run(ctx)
+	}
+	q.main.run(ctx)
+}
 
+// mainOnDue is the main queue's onDue: actually send, then record the
+// outcome. Cleanup only runs once a send is genuinely attempted — not on a
+// job kept queued for a restart, whose upload (if any) must still be there
+// next time.
+func (q *sendQueue) mainOnDue(ctx context.Context, job *sendJob) {
 	if ctx.Err() != nil {
-		q.abandon(job)
+		q.stillQueued(job)
 		return
 	}
-
-	if wait := time.Until(q.gate.due(time.Now())); wait > 0 {
-		fmt.Printf("Holding send %s for %s (rate limit)\n", job.id, wait.Round(time.Second))
-		t := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			q.abandon(job)
-			return
-		case <-t.C:
-		}
-	}
-
+	defer job.cleanup()
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	success, message := q.send(sendCtx, job.req)
@@ -132,96 +145,77 @@ func (q *sendQueue) dispatch(ctx context.Context, job *sendJob) {
 	q.finish(job, success, message)
 }
 
-// drain fails everything still waiting when the bridge stops. Nothing here has
-// been sent, and the queue is memory-only, so each one has to be named in the
-// log: the alternative is a message that silently never went out.
-func (q *sendQueue) drain() {
-	for {
-		select {
-		case job := <-q.jobs:
-			job.cleanup()
-			q.abandon(job)
-		default:
-			return
-		}
-	}
-}
-
-func (q *sendQueue) abandon(job *sendJob) {
-	fmt.Printf("Send %s to %s abandoned: bridge stopped before it left the queue\n", job.id, job.req.Recipient)
-	q.finish(job, false, "bridge stopped before the send left the queue")
-}
-
 // queuePosition is where a submission landed and what that implies for the
 // caller: how many sends are ahead of it (on the main queue, or in the
 // new-contact stage when newContact is set, where ahead counts the other
 // first contacts still waiting there) and a rough expected wait before it
-// goes out, from the gates' means and whatever backlog and reach-out
-// time-lock are in force at submission.
+// goes out.
 type queuePosition struct {
 	ahead      int
 	newContact bool
 	wait       time.Duration
 }
 
-// submit queues a job, returning it and its position. ok is false when the
-// queue is full, in which case nothing is queued and the caller still owns
-// cleanup.
+// submit persists and queues a job, returning it and its position. ok is
+// false when the queue is full or the row could not be persisted, in which
+// case nothing is queued and the caller still owns cleanup.
 func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob, pos queuePosition, ok bool) {
+	q.ensureWired()
 	job = &sendJob{id: newSendID(), req: req, cleanup: cleanup, done: make(chan SendResult, 1)}
-
 	pos.newContact = q.newContacts != nil && q.newContacts.holds(req.Recipient)
+	queuedAt := time.Now()
 
-	// Book the job in before handing it to the worker: a send can complete
-	// before this function returns, and its outcome must not be overwritten by
-	// this one's "queued".
-	q.mu.Lock()
+	var dueAt time.Time
+	var established bool
+	stage := stageMain
 	if pos.newContact {
-		q.held++
-		pos.ahead = q.held - 1
-		pos.wait = q.newContacts.expectedWait(pos.ahead) + q.mainWaitLocked(q.depth)
+		stage = stageNewContact
+		dueAt, pos.ahead, ok, established = q.newContacts.submit(job, queuedAt)
 	} else {
-		q.depth++
-		pos.ahead = q.depth - 1
-		pos.wait = q.mainWaitLocked(pos.ahead)
+		dueAt, pos.ahead, ok = q.main.schedule(job, queuedAt)
 	}
-	q.mu.Unlock()
-	q.record(SendResult{ID: job.id, State: sendQueued, NewContact: pos.newContact, QueuedAt: time.Now()})
-
-	dest := q.jobs
-	if pos.newContact {
-		dest = q.newContacts.jobs
-	}
-	select {
-	case dest <- job:
-		return job, pos, true
-	default:
-		q.forget(job.id, pos.newContact)
+	if !ok {
 		return nil, queuePosition{}, false
 	}
+	pos.wait = q.estimateWait(pos.newContact, dueAt)
+
+	if q.store != nil {
+		if err := q.store.insertJob(job, pos.newContact, stage, dueAt, queuedAt); err != nil {
+			fmt.Printf("Send queue: failed to persist submission %s, refusing it: %v\n", job.id, err)
+			if pos.newContact {
+				q.newContacts.unsubmit(job, established)
+			} else {
+				q.main.remove(job.id)
+			}
+			q.forget(job.id)
+			return nil, queuePosition{}, false
+		}
+	}
+	return job, pos, true
+}
+
+// estimateWait is what queuedMessage tells the caller to expect: the due
+// time already committed for a plain send; for a new contact, that plus a
+// rough allowance for the main queue's current backlog, since the main-queue
+// due time it will actually get is not decided until the stage releases it.
+func (q *sendQueue) estimateWait(newContact bool, dueAt time.Time) time.Duration {
+	wait := waitFrom(dueAt)
+	if newContact {
+		wait += q.main.backlogEstimate()
+	}
+	return wait
 }
 
 // preview reports, without queueing anything, whether a send to recipient
-// would be held as a new contact and roughly how long it would wait: what
-// submit would book it at if called now.
+// would be held as a new contact and roughly how long it would wait: the
+// same backlog-based estimate submit would book it at if called now, for a
+// caller (the blocking-send refusal) that must not actually book anything
+// just to find out.
 func (q *sendQueue) preview(recipient string) (newContact bool, wait time.Duration) {
 	if q.newContacts == nil || !q.newContacts.holds(recipient) {
 		return false, 0
 	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return true, q.newContacts.expectedWait(q.held) + q.mainWaitLocked(q.depth)
-}
-
-// mainWaitLocked estimates how long a send behind `ahead` others on the main
-// queue waits: until the gate's next slot, then one mean gap per send ahead
-// of it. A send in flight has already used its slot, so this errs a gap long
-// while one is out. Called with q.mu held.
-func (q *sendQueue) mainWaitLocked(ahead int) time.Duration {
-	if !q.gate.enabled() {
-		return 0
-	}
-	return waitFrom(q.gate.peek()) + time.Duration(ahead)*q.gate.mean
+	return true, q.newContacts.stage.backlogEstimate() + q.main.backlogEstimate()
 }
 
 // waitFrom is how far off an instant is, or zero once it has passed.
@@ -232,14 +226,19 @@ func waitFrom(t time.Time) time.Duration {
 	return 0
 }
 
-// promote moves a job the new-contact stage is done with onto the main
-// queue's books, before it is actually handed over, so its result and the
-// depth counts never disagree about where it is.
-func (q *sendQueue) promote(job *sendJob) {
-	q.mu.Lock()
-	q.held--
-	q.depth++
-	q.mu.Unlock()
+// stillQueued answers a job's caller when the bridge is stopping before the
+// job could be sent. Unlike finish, it leaves the job's persisted row (and
+// its upload, if any) alone: the row stays "queued" on disk, so the next
+// start's recovery picks the job back up exactly where it was, still owed
+// whatever spacing it was waiting on.
+func (q *sendQueue) stillQueued(job *sendJob) {
+	booked := q.booking(job.id)
+	res := SendResult{
+		ID: job.id, State: sendQueued, Success: false,
+		Message:    "the bridge is restarting; this send is still queued and will resume once it is back",
+		NewContact: booked.NewContact, QueuedAt: booked.QueuedAt,
+	}
+	job.done <- res
 }
 
 func (q *sendQueue) finish(job *sendJob, success bool, message string) {
@@ -252,10 +251,14 @@ func (q *sendQueue) finish(job *sendJob, success bool, message string) {
 		ID: job.id, State: state, Success: success, Message: message,
 		NewContact: booked.NewContact, QueuedAt: booked.QueuedAt, SentAt: time.Now(),
 	}
+	if q.store != nil {
+		if err := q.store.finishJob(job.id, success, message, res.SentAt); err != nil {
+			fmt.Printf("Send queue: failed to persist the outcome of %s: %v\n", job.id, err)
+		} else if err := q.store.prune(); err != nil {
+			fmt.Printf("Send queue: failed to prune old sends: %v\n", err)
+		}
+	}
 	q.record(res)
-	q.mu.Lock()
-	q.depth--
-	q.mu.Unlock()
 	job.done <- res
 }
 
@@ -287,15 +290,11 @@ func (q *sendQueue) record(res SendResult) {
 	q.results[res.ID] = res
 }
 
-// forget drops a booking the queue could not accept.
-func (q *sendQueue) forget(id string, newContact bool) {
+// forget drops a booking for a submission that was scheduled but whose row
+// then failed to persist, so it was never actually queued.
+func (q *sendQueue) forget(id string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if newContact {
-		q.held--
-	} else {
-		q.depth--
-	}
 	delete(q.results, id)
 	for i, known := range q.order {
 		if known == id {
@@ -305,18 +304,35 @@ func (q *sendQueue) forget(id string, newContact bool) {
 	}
 }
 
+// result looks a submission up first in memory, then — if this process never
+// saw it, because it finished before the last restart — in the durable
+// store, so GET /api/send/{id} keeps working for a submission from before
+// the bridge came back.
 func (q *sendQueue) result(id string) (SendResult, bool) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	res, ok := q.results[id]
+	q.mu.Unlock()
+	if ok {
+		return res, true
+	}
+	if q.store == nil {
+		return SendResult{}, false
+	}
+	res, ok, err := q.store.getResult(id)
+	if err != nil {
+		fmt.Printf("Send queue: failed to read %s from the durable store: %v\n", id, err)
+		return SendResult{}, false
+	}
 	return res, ok
 }
 
 // pending is how many submissions have not yet finished, wherever they are.
 func (q *sendQueue) pending() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.depth + q.held
+	n := q.main.depth()
+	if q.newContacts != nil {
+		n += q.newContacts.stage.depth()
+	}
+	return n
 }
 
 // sendQueueStatus is the JSON shape exposed under send_queue in /api/status.
@@ -329,9 +345,91 @@ type sendQueueStatus struct {
 }
 
 func (q *sendQueue) status() sendQueueStatus {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return sendQueueStatus{Pending: q.depth, NewContactsHeld: q.held}
+	held := 0
+	if q.newContacts != nil {
+		held = q.newContacts.stage.depth()
+	}
+	return sendQueueStatus{Pending: q.main.depth(), NewContactsHeld: held}
+}
+
+// attachStore wires a durable store into an already-constructed queue: each
+// stage's scheduling state is restored, every submission still queued from
+// before the restart is recovered onto the right stage in its original
+// order, and orphaned uploads are swept. Only once all of that has succeeded
+// does the queue start persisting further submissions and outcomes — a
+// failure here leaves the queue exactly as it was, memory-only, rather than
+// half-wired to a store it could not fully read. Call it once, after
+// newContacts is set (if it is) and before run.
+func (q *sendQueue) attachStore(store *sendQueueStore) (recovered int, err error) {
+	mainMax, err := store.maxDueAt(stageMain)
+	if err != nil {
+		return 0, fmt.Errorf("reading the main queue's last due time: %v", err)
+	}
+	mainRows, err := store.loadQueued(stageMain)
+	if err != nil {
+		return 0, fmt.Errorf("loading queued submissions: %v", err)
+	}
+	var ncMax time.Time
+	var ncRows []persistedRow
+	if q.newContacts != nil {
+		ncMax, err = store.maxNewContactDueAt()
+		if err != nil {
+			return 0, fmt.Errorf("reading the new-contact stage's last due time: %v", err)
+		}
+		ncRows, err = store.loadQueued(stageNewContact)
+		if err != nil {
+			return 0, fmt.Errorf("loading queued new-contact submissions: %v", err)
+		}
+	}
+
+	// Everything above only reads; only past this point do we start changing
+	// state, once we know there is something consistent to build on.
+	q.store = store
+	q.main.store = store
+	q.main.recoverLastDue(mainMax)
+
+	referenced := map[string]bool{}
+	for _, r := range mainRows {
+		q.loadRecoveredRow(q.main, r, referenced)
+		// A first contact the stage had already released but that has not
+		// gone out yet has no chat in the store, so holds() would still call
+		// the recipient new: remember the release, or a follow-up submitted
+		// before it leaves would be held for a whole gap of its own.
+		if r.NewContact && q.newContacts != nil {
+			if key, ok := contactKey(r.Recipient); ok {
+				q.newContacts.markReleased(key)
+			}
+		}
+	}
+	recovered += len(mainRows)
+
+	if q.newContacts != nil {
+		q.newContacts.stage.store = store
+		q.newContacts.stage.recoverLastDue(ncMax)
+		for _, r := range ncRows {
+			q.loadRecoveredRow(q.newContacts.stage, r, referenced)
+			q.newContacts.trackHeld(r)
+		}
+		recovered += len(ncRows)
+	}
+
+	if removed, sweepErr := sweepOrphanUploads(store.storeDir, referenced); sweepErr != nil {
+		fmt.Printf("Send queue: failed to sweep orphaned uploads: %v\n", sweepErr)
+	} else if removed > 0 {
+		fmt.Printf("Send queue: removed %d orphaned upload(s) left from before the last restart\n", removed)
+	}
+	return recovered, nil
+}
+
+// loadRecoveredRow reconstructs a job from a persisted row, records its
+// still-queued booking and places it on dest at its original due time.
+func (q *sendQueue) loadRecoveredRow(dest *scheduledQueue, r persistedRow, referenced map[string]bool) {
+	if r.MediaPath != "" {
+		referenced[r.MediaPath] = true
+	}
+	job := &sendJob{id: r.ID, req: r.request(), cleanup: uploadCleanup(r), done: make(chan SendResult, 1)}
+	dest.load([]*scheduledJob{{job: job, dueAt: r.DueAt}})
+	q.record(SendResult{ID: job.id, State: sendQueued, NewContact: r.NewContact, QueuedAt: r.QueuedAt})
 }
 
 func newSendID() string {

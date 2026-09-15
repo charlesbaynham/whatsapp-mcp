@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -193,7 +194,7 @@ func TestResultsAreBounded(t *testing.T) {
 	}
 }
 
-func TestShutdownWhileHeldByTheRateLimitFailsTheJob(t *testing.T) {
+func TestShutdownWhileHeldByTheRateLimitStaysQueued(t *testing.T) {
 	var mu sync.Mutex
 	var sentTo []string
 	q := newSendQueue(newTestGate(time.Hour), func(_ context.Context, req SendMessageRequest) (bool, string) {
@@ -211,9 +212,11 @@ func TestShutdownWhileHeldByTheRateLimitFailsTheJob(t *testing.T) {
 	waitFor(t, first.done)
 	cancel()
 
+	// A restart, not a failure: the row stays queued on disk and the caller
+	// is told it will resume, since the message never actually went anywhere.
 	res := waitFor(t, held.done)
-	if res.Success {
-		t.Fatal("a job held at shutdown reported success")
+	if res.Success || res.State != sendQueued {
+		t.Fatalf("result = %+v, want still queued, not a failure", res)
 	}
 
 	mu.Lock()
@@ -266,10 +269,19 @@ func TestRefusedSubmissionLeavesNoTrace(t *testing.T) {
 	}
 }
 
-func TestShutdownFailsEverythingStillWaiting(t *testing.T) {
+// A restart must not fail whatever a slow, blocked send left behind it in
+// the queue: only the one already being sent runs to completion (and has its
+// upload cleaned up as usual); everything else stays queued, on disk and in
+// memory, uploads untouched, for the next start's recovery.
+func TestShutdownKeepsUnsentSubmissionsQueued(t *testing.T) {
 	t.Setenv("WHATSAPP_SEND_MAX_QUEUE_DEPTH", "10")
 	block := make(chan struct{})
+	started := make(chan struct{}, 1)
 	q := newSendQueue(newTestGate(0), func(context.Context, SendMessageRequest) (bool, string) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		<-block
 		return true, "sent"
 	})
@@ -286,25 +298,39 @@ func TestShutdownFailsEverythingStillWaiting(t *testing.T) {
 		jobs = append(jobs, job)
 	}
 
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first job never started sending")
+	}
 	cancel()
-	close(block)
+	close(block) // let the one already in flight finish
 
-	// Nothing may be left holding a caller or silently dropped: every job ends
-	// with a result, and every upload is cleaned up.
-	for i, job := range jobs {
+	first := waitFor(t, jobs[0].done)
+	if first.State != sendSent || !first.Success {
+		t.Fatalf("in-flight job = %+v, want it to complete normally", first)
+	}
+	select {
+	case <-cleaned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight job's upload was never cleaned up")
+	}
+
+	for i, job := range jobs[1:] {
 		res := waitFor(t, job.done)
-		if res.State == sendQueued {
-			t.Fatalf("job %d still reads as queued after shutdown", i)
+		if res.State != sendQueued || res.Success {
+			t.Fatalf("job %d = %+v, want still queued", i+1, res)
 		}
-		if stored, _ := q.result(job.id); stored.State == sendQueued {
-			t.Fatalf("job %d left recorded as queued; a client would wait forever", i)
+		if !strings.Contains(res.Message, "restart") {
+			t.Fatalf("job %d message %q does not explain the send will resume", i+1, res.Message)
+		}
+		if stored, ok := q.result(job.id); !ok || stored.State != sendQueued {
+			t.Fatalf("job %d recorded as %+v, want it to still read as queued", i+1, stored)
 		}
 	}
-	for range jobs {
-		select {
-		case <-cleaned:
-		case <-time.After(5 * time.Second):
-			t.Fatal("an upload was never cleaned up at shutdown")
-		}
+	select {
+	case <-cleaned:
+		t.Fatal("a job kept queued for a restart must not have its upload cleaned up")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
