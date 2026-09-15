@@ -246,7 +246,9 @@ class WhatsAppClient:
         separate, much more slowly drained queue first.
 
         ``block=True`` waits for it to actually leave and returns the send's own
-        outcome instead. Either way the id can be passed to `send_status`.
+        outcome instead; for a first contact it is refused (BridgeError, status
+        422) rather than held for hours. Either way the id can be passed to
+        `send_status`.
         """
         return self._json("POST", "/send", timeout=self._send_timeout(block), ok=SEND_OK,
                           json={"recipient": recipient, "message": message, "block": block})

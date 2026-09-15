@@ -31,6 +31,18 @@ func roughDuration(d time.Duration) string {
 	}
 }
 
+// blockedFirstContactMessage is the refusal for a blocking send to a first
+// contact. Such a send is held for hours by the new-contact queue, far past
+// any caller's patience, so rather than accept it and let the caller time out
+// (which reads as the bridge dying) nothing is queued and the caller is told
+// to resubmit asynchronously if it really means it.
+func blockedFirstContactMessage(recipient string, wait time.Duration) string {
+	return fmt.Sprintf("Refusing a blocking send to %s: this recipient has never been messaged from this account, "+
+		"so the send would be held in the new-contact queue for roughly %s before it went out — far too long to block on. "+
+		"Nothing was queued. If you actually want to send this, resubmit it without block (asynchronously) and poll its id for the outcome.",
+		recipient, roughDuration(wait))
+}
+
 // sendHandler accepts a message and hands it to the queue. ready reports
 // whether WhatsApp is connected, injected so the handler is testable without a
 // live client.
@@ -84,6 +96,21 @@ func sendHandler(queue *sendQueue, storeDir string, ready func(http.ResponseWrit
 			fmt.Println("Received request to send message", req.Message, req.MediaPath)
 		default:
 			fmt.Println("Received request to send message to", req.Recipient)
+		}
+
+		if req.Block {
+			if held, wait := queue.preview(req.Recipient); held {
+				fmt.Printf("Refusing blocking send to first contact %s (would be held ~%s)\n", req.Recipient, roughDuration(wait))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				json.NewEncoder(w).Encode(SendMessageResponse{
+					Success:              false,
+					NewContact:           true,
+					EstimatedWaitSeconds: int(wait / time.Second),
+					Message:              blockedFirstContactMessage(req.Recipient, wait),
+				})
+				return
+			}
 		}
 
 		job, pos, queued := queue.submit(req, cleanup)

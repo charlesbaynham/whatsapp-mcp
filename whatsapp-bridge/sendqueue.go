@@ -201,6 +201,18 @@ func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob
 	}
 }
 
+// preview reports, without queueing anything, whether a send to recipient
+// would be held as a new contact and roughly how long it would wait: what
+// submit would book it at if called now.
+func (q *sendQueue) preview(recipient string) (newContact bool, wait time.Duration) {
+	if q.newContacts == nil || !q.newContacts.holds(recipient) {
+		return false, 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return true, q.newContacts.expectedWait(q.held) + q.mainWaitLocked(q.depth)
+}
+
 // mainWaitLocked estimates how long a send behind `ahead` others on the main
 // queue waits: until the gate's next slot, then one mean gap per send ahead
 // of it. A send in flight has already used its slot, so this errs a gap long
