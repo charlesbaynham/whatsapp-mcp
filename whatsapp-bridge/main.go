@@ -387,13 +387,13 @@ func parseRecipient(recipient string) (types.JID, error) {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath string, voiceNote bool, logger waLog.Logger) (bool, string) {
-	return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, recipient, message, mediaPath, "", voiceNote, nil, logger)
+func sendWhatsAppMessage(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath string, voiceNote bool, typing *typingManager, logger waLog.Logger) (bool, string) {
+	return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, recipient, message, mediaPath, "", voiceNote, nil, typing, logger)
 }
 
 // sendWhatsAppMedia is sendWhatsAppMessage with an explicit document title,
 // or, with poll set, a poll instead of text or media.
-func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath, title string, voiceNote bool, poll *PollSpec, logger waLog.Logger) (bool, string) {
+func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, reachoutLock *reachoutTimelock, recipient, message, mediaPath, title string, voiceNote bool, poll *PollSpec, typing *typingManager, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -593,6 +593,12 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 	// message this connection just sent gets no such event. Mirror it into the
 	// store here, or it delivers but never appears in list_messages/get_chat.
 	chatJID := recipientJID.String()
+
+	// The reply has landed, so whatever was typing for this chat is done:
+	// without this the refresher would put "typing…" back up seconds after
+	// the message the guest was waiting for.
+	typing.StopChat(chatJID)
+
 	mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
 	content := message
 	if poll != nil {
@@ -1019,12 +1025,12 @@ func requireReady(client *whatsmeow.Client, w http.ResponseWriter) bool {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, reachoutLock *reachoutTimelock, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
+func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, messageStore *MessageStore, pub *Publisher, transcriber *Transcriber, reachoutLock *reachoutTimelock, typing *typingManager, addr, socketGroup string, logBodies bool, logger waLog.Logger) *http.Server {
 	mux := http.NewServeMux()
 	dispatcher := pub.dispatcher
 
 	queue := newSendQueue(newSendGateFromEnv(), func(ctx context.Context, req SendMessageRequest) (bool, string) {
-		return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, req.poll, logger)
+		return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, req.poll, typing, logger)
 	})
 	queue.newContacts = newNewContactStage(newNewContactGateFromEnv(), func(recipient string) bool {
 		return isNewContact(messageStore, recipient)
@@ -1043,6 +1049,9 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 	registerPollRoutes(mux, messageStore)
 	registerEventRoutes(mux, messageStore, pub)
 	registerTranscribeRoutes(mux, messageStore, transcriber)
+	registerTypingRoutes(mux, typing, func(w http.ResponseWriter) bool {
+		return requireReady(client, w)
+	})
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		jid := ""
@@ -1386,6 +1395,13 @@ func main() {
 	dispatcher := NewWebhookDispatcher(messageStore, logger)
 	pub := NewPublisher(messageStore, dispatcher, logger)
 
+	// "Typing…" while an agent works out its reply, from the moment the
+	// message lands rather than from whenever the woken session first calls
+	// in. The hook is what ties it to an incoming message; the send path and
+	// the hold's own deadline are what take it away again.
+	typing := newTypingManagerFromEnv(client, logger)
+	dispatcher.onWake = typing.WakeForChat
+
 	// Voice notes are transcribed locally before publication (see transcribe.go).
 	transcriber := NewTranscriber(newTranscriberConfigFromEnv(storeDir), messageStore, pub, logger)
 	transcriber.fetch = func(ctx context.Context, chatJID, messageID string) (string, error) {
@@ -1452,7 +1468,7 @@ func main() {
 	queueCtx, stopQueue := context.WithCancel(ctx)
 	defer stopQueue()
 
-	server := startRESTServer(queueCtx, client, messageStore, pub, transcriber, reachoutLock, bridgeAddr, socketGroup, logBodies, logger)
+	server := startRESTServer(queueCtx, client, messageStore, pub, transcriber, reachoutLock, typing, bridgeAddr, socketGroup, logBodies, logger)
 	defer server.Close()
 
 	if client.Store.ID == nil {

@@ -388,6 +388,13 @@ type WebhookDispatcher struct {
 
 	rateMu sync.Mutex
 	hits   map[int64][]time.Time
+
+	// onWake, when set, is called with the chat of an incoming message that
+	// matches a subscription whose job is to wake an agent that answers
+	// (kind claude_routine). It is what puts "typing…" in front of the guest
+	// while that agent is spun up and thinking — see typing.go. Set once at
+	// startup, before any event is dispatched.
+	onWake func(chatJID string)
 }
 
 type pendingBatch struct {
@@ -419,11 +426,24 @@ func (d *WebhookDispatcher) dispatch(event WebhookEvent) {
 		d.logger.Warnf("webhook: failed to look up subscriptions for %s: %v", event.ChatJID, err)
 		return
 	}
+	wake := false
 	for _, sub := range subs {
 		if event.IsFromMe && !sub.IncludeFromMe {
 			continue
 		}
+		// A claude_routine subscription exists to make an agent answer this
+		// chat, so an incoming message on one is a reply being worked on.
+		// A generic consumer makes no such promise and gets no indicator.
+		if !event.IsFromMe && sub.Kind == webhookKindClaudeRoutine {
+			wake = true
+		}
 		d.enqueueOrSend(sub, event)
+	}
+	// After the deliveries are under way, and regardless of how they go: the
+	// debounce window means the woken session may be a minute off yet, which
+	// is exactly the gap the indicator is there to fill.
+	if wake && d.onWake != nil {
+		d.onWake(event.ChatJID)
 	}
 }
 

@@ -48,6 +48,26 @@ class RequestShapeTests(unittest.TestCase):
             "query": "bob", "limit": "5", "page": "0", "include_last_message": "false",
             "sort_by": "last_active", "unread_only": "true"})
 
+    def test_start_typing_body(self):
+        client, rec = make_client(lambda r: httpx.Response(200, json={"success": True}))
+        client.start_typing("c@s.whatsapp.net", 90)
+        req = rec.requests[0]
+        self.assertEqual(req.url.path, "/api/typing")
+        self.assertEqual(json.loads(req.content), {
+            "chat_jid": "c@s.whatsapp.net", "state": "composing", "duration_seconds": 90})
+
+    def test_start_typing_without_a_duration_leaves_it_to_the_bridge(self):
+        client, rec = make_client(lambda r: httpx.Response(200, json={"success": True}))
+        client.start_typing("c@s.whatsapp.net")
+        self.assertEqual(json.loads(rec.requests[0].content), {
+            "chat_jid": "c@s.whatsapp.net", "state": "composing"})
+
+    def test_stop_typing_body(self):
+        client, rec = make_client(lambda r: httpx.Response(200, json={"success": True}))
+        client.stop_typing("c@s.whatsapp.net")
+        self.assertEqual(json.loads(rec.requests[0].content), {
+            "chat_jid": "c@s.whatsapp.net", "state": "paused"})
+
     def test_get_chat_404_is_none(self):
         client, _ = make_client(lambda r: httpx.Response(404, json={"error": "nope"}))
         self.assertIsNone(client.get_chat("x@s.whatsapp.net"))

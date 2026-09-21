@@ -23,6 +23,25 @@ class ErrorFoldingTests(unittest.TestCase):
             out = main.mark_chat_read("c@s.whatsapp.net")
         self.assertEqual(out, {"success": False, "message": "boom", "marked_count": 0, "receipt_sent": False})
 
+    def test_start_typing_passes_the_duration_through(self):
+        with mock.patch.object(main.wa, "start_typing", return_value={"success": True}) as st:
+            main.start_typing("c@s.whatsapp.net", 120)
+        st.assert_called_once_with("c@s.whatsapp.net", 120)
+
+    def test_start_typing_default_duration_is_the_bridges(self):
+        with mock.patch.object(main.wa, "start_typing", return_value={"success": True}) as st:
+            main.start_typing("c@s.whatsapp.net")
+        st.assert_called_once_with("c@s.whatsapp.net", None)
+
+    def test_typing_needs_a_chat(self):
+        self.assertFalse(main.start_typing("")["success"])
+        self.assertFalse(main.stop_typing("")["success"])
+
+    def test_stop_typing_folds_errors(self):
+        with mock.patch.object(main.wa, "stop_typing", side_effect=BridgeError("not connected", status=503)):
+            self.assertEqual(main.stop_typing("c@s.whatsapp.net"),
+                             {"success": False, "message": "not connected"})
+
     def test_unsubscribe_404(self):
         with mock.patch.object(main.wa, "delete_webhook", side_effect=BridgeError("nf", status=404)):
             self.assertIn("not found", main.unsubscribe_chat(7)["message"])

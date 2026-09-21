@@ -551,6 +551,51 @@ def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
 
 
 @mcp.tool()
+def start_typing(chat_jid: str, duration_seconds: int = 0) -> Dict[str, Any]:
+    """Show "typing..." in a chat while a reply is being worked out.
+
+    The bridge starts this by itself when an incoming message wakes an agent
+    to answer, so the usual reasons to call it are to extend a hold through a
+    long piece of work, or to start one in a chat you are about to answer
+    without having been woken by it. Starting a hold that already exists
+    extends it rather than stacking a second one.
+
+    Every hold expires on its own (duration_seconds, or the bridge's default
+    of a few minutes) and is cleared automatically once a message goes out to
+    that chat. If the decision turns out to be NOT to reply -- an escalation,
+    a chat that gets no replies, nothing to say -- call stop_typing rather
+    than letting it lapse: an indicator left running promises a reply that is
+    not coming.
+
+    Args:
+        chat_jid: The JID of the chat to appear to be typing in
+        duration_seconds: How long the hold lasts unrenewed (0 = the bridge's default)
+    """
+    if not chat_jid:
+        return {"success": False, "message": "chat_jid must be provided"}
+    return _result(lambda: wa.start_typing(chat_jid, duration_seconds or None))
+
+
+@mcp.tool()
+def stop_typing(chat_jid: str) -> Dict[str, Any]:
+    """Take "typing..." away again in a chat.
+
+    Call this as soon as it is settled that no message is going to this chat
+    now -- the reply was escalated for approval, the chat is one that is never
+    replied to, or there is simply nothing to send. Sending a message clears
+    the indicator by itself, so this is for the case where nothing is sent.
+
+    Harmless to call for a chat that is not showing one.
+
+    Args:
+        chat_jid: The JID of the chat to stop typing in
+    """
+    if not chat_jid:
+        return {"success": False, "message": "chat_jid must be provided"}
+    return _result(lambda: wa.stop_typing(chat_jid))
+
+
+@mcp.tool()
 def send_file(recipient: str, media_path: str, block: bool = False) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
@@ -673,6 +718,14 @@ def subscribe_chat(
       debounce_seconds (e.g. 30-120) to avoid firing a run per message.
     - kind="generic": POSTs the same body to any other URL/webhook receiver,
       using `headers` for any extra headers it needs beyond the bearer token.
+
+    A claude_routine subscription also makes the bridge show "typing..." in
+    the chat from the moment an incoming message arrives, since the point of
+    the subscription is that an agent answers it -- including through the
+    debounce window, before the woken session exists. The woken session owns
+    that indicator from then on: it is cleared when the reply is sent, by
+    stop_typing when the decision is not to reply, and by its own deadline if
+    the session dies. kind="generic" gets no indicator.
 
     chat_jid may be a specific chat's JID, or "*" to subscribe to messages
     across all chats.
