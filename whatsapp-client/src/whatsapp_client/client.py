@@ -365,6 +365,29 @@ class WhatsAppClient:
             "oldest_message_timestamp": oldest_message_timestamp,
             "oldest_message_from_me": oldest_message_from_me, "count": count})
 
+    # --- typing indicator ---
+
+    def start_typing(self, chat_jid: str, duration_seconds: Optional[int] = None) -> Dict[str, Any]:
+        """Show "typing…" in a chat and keep it showing.
+
+        The bridge repeats the chatstate until `duration_seconds` runs out (its
+        own default if that is omitted), until `stop_typing`, or until a
+        message goes out to that chat. The deadline matters: whoever started
+        the hold may never come back to clear it.
+        """
+        body: Dict[str, Any] = {"chat_jid": chat_jid, "state": "composing"}
+        if duration_seconds:
+            body["duration_seconds"] = int(duration_seconds)
+        return self._json("POST", "/typing", json=body)
+
+    def stop_typing(self, chat_jid: str) -> Dict[str, Any]:
+        """Take "typing…" away again — the reply is sent, or there isn't one."""
+        return self._json("POST", "/typing", json={"chat_jid": chat_jid, "state": "paused"})
+
+    def typing_holds(self) -> List[Dict[str, Any]]:
+        """Every chat currently showing "typing…", oldest first."""
+        return self._json("GET", "/typing")
+
     # --- webhooks ---
 
     def list_webhooks(self) -> List[Dict[str, Any]]:

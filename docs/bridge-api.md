@@ -38,6 +38,7 @@ in the new-contact queue in front of it.
 | GET | `/contacts/{jid}/last-interaction` | | newest `Message` involving the contact, or 404 |
 | GET | `/messages` | `chat_jid, sender, query, after, before, limit, page, include_context, context_before, context_after` | `[Message]`, newest first; with `include_context` each hit is expanded to before/hit/after |
 | GET | `/messages/{id}/context` | `before, after, chat_jid` | `{message, before, after}` (before/after in chronological order) |
+| GET | `/typing` | | `[{chat_jid, started_at, expires_at}]` — the chats currently showing "typing…", oldest first. Always 200, including before the bridge is connected. |
 | GET | `/polls` | `chat_jid, limit, page` | `[Message]` with `media_type: poll`, newest first, each with its `poll` outcome |
 | GET | `/polls/{chat_jid}/{message_id}` | | `PollResults` or 404 |
 
@@ -72,6 +73,7 @@ last_is_from_me, unread_count, last_read_at, is_group`.
 | POST | `/download` | `{message_id, chat_jid}` | Downloads into the store; returns `{success, message, filename, path}` |
 | GET | `/media/{chat_jid}/{message_id}` | | Streams the attachment's bytes (downloading first if needed) |
 | POST | `/mark-read` | `{chat_jid, send_receipt}` | The only way read state changes. `send_receipt` sends real blue ticks. Emits `chat.read`. |
+| POST | `/typing` | `{chat_jid, state?, duration_seconds?}` | Shows or clears "typing…" in a chat. `state` is `composing` (the default) or `paused`. A composing hold keeps the chatstate repeating until `duration_seconds` (default `WHATSAPP_BRIDGE_TYPING_TTL_SECONDS`, 300, max 1800) runs out, until a `paused` request, or until a message goes out to that chat — whichever comes first; it answers `{success, chat_jid, state, expires_at}`. Starting a hold that already exists extends it (never shortens it) rather than stacking a second refresher, and `paused` is accepted for a chat with no hold. `503` when the bridge has typing turned off (`WHATSAPP_BRIDGE_TYPING=off`). |
 | POST | `/resync` | `{chat_jid, oldest_message_id, oldest_message_timestamp, oldest_message_from_me?, count?}` | Asks WhatsApp for older history before a known message |
 | POST | `/messages/{chat_jid}/{id}/transcribe` | | Queues an on-demand transcription of a voice note; a `message.updated` event follows. 503 if transcription is disabled. |
 
@@ -111,3 +113,9 @@ Unchanged from before and fed from the same event log: `GET/POST
 subscription because the consumer is remote; they are single-attempt,
 rate-capped and auto-disabling, which suits firing a Claude routine but not
 a consumer that must see every message. Use the event stream for that.
+
+An incoming message matching an enabled `claude_routine` subscription also
+starts a typing hold on its chat (`POST /api/typing` above), at dispatch
+time rather than at delivery — with a debounce window the delivery, and the
+session it wakes, can be a minute later, and the indicator is there to cover
+exactly that gap. `generic` subscriptions do not start one.

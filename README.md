@@ -106,6 +106,8 @@ own user, admitted to the socket by group membership and nothing else.
 | `WHATSAPP_NEW_CONTACT_GAP_MEAN_SECONDS` | `1800` | Mean gap between sends to *new contacts* (people never messaged from this account), drawn Exponential per contact, floor 60 s. `0` disables the separate new-contact queue |
 | `WHATSAPP_SEND_MAX_QUEUE_DEPTH` | `100` | Submissions accepted before the queue is full and further ones are refused |
 | `WHATSAPP_TRANSCRIBE` | unset | Set to `1` to transcribe incoming voice notes locally with whisper.cpp |
+| `WHATSAPP_BRIDGE_TYPING` | on | Set to `off` to stop the bridge showing "typing…" in a chat while an agent works on a reply (see "Typing indicators" below) |
+| `WHATSAPP_BRIDGE_TYPING_TTL_SECONDS` | `300` | How long a typing hold lasts if nothing renews or rescinds it (max 1800) |
 | `WHATSAPP_WHISPER_MODEL` | `<store>/models/ggml-base.bin` | whisper.cpp model file; downloaded on first use if missing |
 | `WHATSAPP_WHISPER_BIN` | `whisper-cli` | whisper.cpp binary name or path |
 
@@ -282,6 +284,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 - **mark_chat_read**: Explicitly mark a chat as read, optionally sending real read receipts
+- **start_typing**: Show "typing…" in a chat while a reply is being worked out (the bridge starts this by itself when a message wakes an agent; this extends it)
+- **stop_typing**: Take "typing…" away again when the decision turns out to be not to reply
 - **subscribe_chat**: Push new messages in a chat (or `"*"` for all chats) to a URL as they arrive, instead of polling
 - **unsubscribe_chat**: Remove a chat subscription created by `subscribe_chat`
 - **enable_subscription**: Re-enable a subscription that the bridge auto-disabled, or that expired
@@ -331,6 +335,48 @@ Instead of polling, you can have the bridge push new messages to a URL as they a
 3. Call `subscribe_chat(chat_jid="1234567890@s.whatsapp.net", url="https://api.anthropic.com/v1/claude_code/routines/trig_abc123/fire", bearer_token="<routine token>", debounce_seconds=60, ttl_seconds=3600)`.
 4. Every new message in that chat now starts a new Routine run. `debounce_seconds` is recommended for busy chats since each `POST` starts a fresh run — without it, a burst of messages triggers a burst of runs. `ttl_seconds=3600` here means the subscription stops itself after an hour.
 5. Use `test_subscription(subscription_id)` to confirm the fire URL accepts requests before relying on it live.
+
+### Typing indicators
+
+An agent answering a message takes time to do it: the session has to start,
+read the thread, work out a reply and get it past whatever approval the
+deployment puts in front of sending. From the other end that is silence, so
+the bridge shows "typing…" in the chat for the duration.
+
+It starts by itself, without anyone asking: when an incoming message matches
+a `claude_routine` subscription — a subscription whose whole purpose is that
+an agent answers that chat — the bridge sends the composing chatstate at the
+moment the message lands, and repeats it every few seconds (WhatsApp drops
+the indicator within seconds of the last one). That is well before the woken
+session exists, which is the point: with `debounce_seconds` set, the wake
+itself can be a minute away. A `generic` subscription makes no promise that
+anyone is replying, so it gets no indicator, and `WHATSAPP_BRIDGE_TYPING=off`
+turns the feature off entirely.
+
+Every hold ends, three ways:
+
+- **A message goes out to that chat.** The send path clears the hold, so the
+  refresher cannot put "typing…" back up seconds after the reply lands.
+- **Somebody rescinds it** — `stop_typing(chat_jid)`, or
+  `POST /api/typing {"state": "paused"}`. This is what a session should do the
+  moment it settles that nothing is being sent: a reply escalated for
+  approval, a chat that is never replied to, nothing to say. An indicator
+  left running is a promise of a reply that is not coming.
+- **Its deadline passes** (`WHATSAPP_BRIDGE_TYPING_TTL_SECONDS`, 5 minutes by
+  default). The agent may be an ephemeral session that dies mid-thought, so
+  no hold outlives its TTL; the paused chatstate goes out when it lapses,
+  rather than being left to WhatsApp's own few-second timeout.
+
+`start_typing(chat_jid, duration_seconds)` starts or extends a hold by hand —
+for a long piece of work, or for a chat being answered without a wake. Holds
+do not stack: a second start extends the first, and can only ever push its
+deadline further out.
+
+WhatsApp only shows chat presence from a client it believes is online, so the
+bridge marks the account available for as long as anything is typing and goes
+back to unavailable once nothing is. That also makes delivery receipts active
+while it is online (whatsmeow's behaviour for an available client). Read state
+is unaffected: blue ticks still only move through `mark_chat_read`.
 
 ### Read/Unread Tracking
 
