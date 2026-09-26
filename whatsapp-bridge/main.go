@@ -989,24 +989,16 @@ func downloadMedia(ctx context.Context, client *whatsmeow.Client, messageStore *
 	return true, mediaType, safeName, absPath, nil
 }
 
-// Extract direct path from a WhatsApp media URL
+// extractDirectPathFromURL turns a stored media URL into the direct path
+// whatsmeow downloads from. The query string must survive: oh/oe are the
+// signed auth for the path, and whatsmeow appends "&hash=…" assuming a "?"
+// is already there. Stripping it makes every media download 403.
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+		return url
 	}
-
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // requireReady writes a 503 JSON error and returns false unless the client is
