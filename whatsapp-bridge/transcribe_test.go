@@ -208,3 +208,11 @@ func TestCleanTranscript(t *testing.T) {
 		t.Error("lines not joined")
 	}
 }
+
+func TestExtractDirectPathKeepsSignedQuery(t *testing.T) {
+	got := extractDirectPathFromURL("https://mmg.whatsapp.net/v/t62.7117-24/123_n.enc?ccb=11-4&oh=abc&oe=68D0&_nc_sid=5e03e0&mms3=true")
+	want := "/v/t62.7117-24/123_n.enc?ccb=11-4&oh=abc&oe=68D0&_nc_sid=5e03e0&mms3=true"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
