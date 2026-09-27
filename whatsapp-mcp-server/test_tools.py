@@ -1,9 +1,11 @@
 """Tool-level tests: the MCP tools are thin wrappers, so these check error
 folding and the few places the server reshapes bridge output."""
 
-import base64
+import time
 import unittest
 from unittest import mock
+
+from starlette.testclient import TestClient
 
 import main
 from whatsapp_client import BridgeError
@@ -148,35 +150,68 @@ class ReshapeTests(unittest.TestCase):
         with mock.patch.object(main.wa, "download_media", side_effect=BridgeError("nope")):
             self.assertFalse(main.download_media("m", "c")["success"])
 
-    def test_view_media_returns_the_image(self):
+
+class MediaLinkTests(unittest.TestCase):
+    """media_link issues a URL; the /media route serves it over real HTTP."""
+
+    def setUp(self):
+        patcher = mock.patch.object(main, "MEDIA_PUBLIC_URL", "https://wa.example")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.http = TestClient(main.mcp.streamable_http_app())
+
+    def _link(self, **kw):
+        with mock.patch.object(main.wa, "download_media",
+                               return_value={"success": True, "filename": "image.jpg", "path": "/data/store/x"}):
+            return main.media_link("m1", "447700900000:24@s.whatsapp.net", **kw)
+
+    def test_link_fetches_the_bytes(self):
+        out = self._link()
+        self.assertTrue(out["success"])
+        self.assertTrue(out["url"].startswith("https://wa.example/media/"))
+        self.assertEqual(out["filename"], "image.jpg")
+        path = out["url"][len("https://wa.example"):]
         with mock.patch.object(main.wa, "get_media", return_value=(b"\xff\xd8jpeg", "image/jpeg")) as gm:
-            out = main.view_media("m", "447700900000:24@s.whatsapp.net")
-        gm.assert_called_once_with("447700900000:24@s.whatsapp.net", "m")
-        self.assertIsInstance(out, main.Image)
-        content = out.to_image_content()
-        self.assertEqual(content.mimeType, "image/jpeg")
-        self.assertEqual(base64.b64decode(content.data), b"\xff\xd8jpeg")
+            resp = self.http.get(path)
+        gm.assert_called_once_with("447700900000:24@s.whatsapp.net", "m1")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, b"\xff\xd8jpeg")
+        self.assertEqual(resp.headers["content-type"], "image/jpeg")
 
-    def test_view_media_accepts_a_content_type_with_parameters(self):
-        with mock.patch.object(main.wa, "get_media", return_value=(b"x", "image/webp; charset=binary")):
-            self.assertIsInstance(main.view_media("m", "c"), main.Image)
+    def test_tampered_token_is_refused(self):
+        token = self._link()["url"].rsplit("/", 1)[1]
+        body, sig = token.split(".")
+        forged = main._b64(b'{"c":"other@s.whatsapp.net","m":"m9","e":9999999999}')
+        for bad in (f"{forged}.{sig}", f"{body}.{sig[:-2]}AA", "garbage", body):
+            with mock.patch.object(main.wa, "get_media") as gm:
+                self.assertEqual(self.http.get(f"/media/{bad}").status_code, 403, bad)
+            gm.assert_not_called()
 
-    def test_view_media_refuses_non_images(self):
-        with mock.patch.object(main.wa, "get_media", return_value=(b"%PDF", "application/pdf")):
-            out = main.view_media("m", "c")
+    def test_expired_token_is_refused(self):
+        token = main.make_media_token("c", "m", int(time.time()) - 1)
+        with mock.patch.object(main.wa, "get_media") as gm:
+            self.assertEqual(self.http.get(f"/media/{token}").status_code, 403)
+        gm.assert_not_called()
+
+    def test_ttl_is_capped(self):
+        out = self._link(ttl_seconds=10**9)
+        claims = main.read_media_token(out["url"].rsplit("/", 1)[1])
+        self.assertLessEqual(claims["e"], time.time() + main.MEDIA_LINK_MAX_TTL + 1)
+
+    def test_unknown_message_fails_at_link_time(self):
+        with mock.patch.object(main.wa, "download_media", side_effect=BridgeError("failed to find message", status=404)):
+            out = main.media_link("m1", "447700900000@s.whatsapp.net")
         self.assertFalse(out["success"])
-        self.assertIn("application/pdf", out["message"])
-
-    def test_view_media_refuses_oversize_images(self):
-        big = b"x" * (main.MAX_VIEW_BYTES + 1)
-        with mock.patch.object(main.wa, "get_media", return_value=(big, "image/png")):
-            self.assertFalse(main.view_media("m", "c")["success"])
-
-    def test_view_media_folds_bridge_errors(self):
-        with mock.patch.object(main.wa, "get_media", side_effect=BridgeError("failed to find message", status=404)):
-            out = main.view_media("m", "c")
-        self.assertEqual(out["success"], False)
         self.assertIn("failed to find message", out["message"])
+
+    def test_media_gone_from_bridge_is_404(self):
+        token = main.make_media_token("c", "m", int(time.time()) + 60)
+        with mock.patch.object(main.wa, "get_media", side_effect=BridgeError("not found", status=404)):
+            self.assertEqual(self.http.get(f"/media/{token}").status_code, 404)
+
+    def test_disabled_without_public_url(self):
+        with mock.patch.object(main, "MEDIA_PUBLIC_URL", ""):
+            self.assertFalse(main.media_link("m", "c")["success"])
 
 
 class BatchSendTests(unittest.TestCase):

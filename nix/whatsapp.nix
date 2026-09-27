@@ -169,6 +169,19 @@ in
       '';
     };
 
+    mediaPublicUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://whatsapp.example.org";
+      description = ''
+        Base URL at which the MCP server's /media route is reachable by the
+        agents that call media_link, which hands out signed, short-lived links
+        under it. The route authenticates by its token alone, so the ingress
+        must pass /media/* through without the MCP auth layer. Null disables
+        media_link.
+      '';
+    };
+
     allowedSources = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ "10.0.1.34" "10.0.1.31" "10.0.1.3" ];
@@ -274,6 +287,8 @@ in
         PYTHONPATH = "${cfg.clientSource}/src";
         # The source runs straight from the read-only store path.
         PYTHONDONTWRITEBYTECODE = "1";
+      } // lib.optionalAttrs (cfg.mediaPublicUrl != null) {
+        MEDIA_PUBLIC_URL = cfg.mediaPublicUrl;
       };
       addressFamilies = [ "AF_INET" "AF_INET6" ];
       execStart = "${cfg.pythonEnv}/bin/python ${cfg.mcpSource}/main.py";
