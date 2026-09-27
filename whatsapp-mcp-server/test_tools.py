@@ -59,6 +59,16 @@ class ErrorFoldingTests(unittest.TestCase):
             main.send_file("1", "/tmp/x.jpg")
         sf.assert_called_once_with("1", path="/tmp/x.jpg", block=False)
 
+    def test_idempotency_key_reaches_the_bridge(self):
+        with mock.patch.object(main.wa, "send_message",
+                               return_value={"success": True, "duplicate": True, "id": "snd-1"}) as sm:
+            out = main.send_message("1", "hi", idempotency_key="reply-1")
+        sm.assert_called_once_with("1", "hi", block=False, idempotency_key="reply-1")
+        self.assertTrue(out["duplicate"])
+        with mock.patch.object(main.wa, "send_message", return_value={"success": True, "id": "snd-2"}) as sm:
+            main.send_messages([{"recipient": "1", "message": "a", "idempotency_key": "k"}])
+        sm.assert_called_once_with("1", "a", idempotency_key="k")
+
     def test_block_reaches_the_bridge(self):
         with mock.patch.object(main.wa, "send_message", return_value={"success": True, "message": "sent"}) as sm:
             main.send_message("1", "hi", block=True)

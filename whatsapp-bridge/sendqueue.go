@@ -73,12 +73,20 @@ type sendQueue struct {
 	mu      sync.Mutex
 	results map[string]SendResult
 	order   []string
+	// keys maps an idempotency key to the submission that last used it; an
+	// entry goes when that submission's result is evicted from results.
+	keys map[string]string
+
+	// keyedMu serialises keyed submissions, so two racing sends with one key
+	// cannot both find it unused and both queue.
+	keyedMu sync.Mutex
 }
 
 func newSendQueue(gate *sendGate, send func(context.Context, SendMessageRequest) (bool, string)) *sendQueue {
 	q := &sendQueue{
 		send:    send,
 		results: make(map[string]SendResult, resultsKept),
+		keys:    make(map[string]string),
 	}
 	q.main = newScheduledQueue(stageMain, gate, queueDepthFromEnv(), q.mainOnDue)
 	q.main.onShutdown = q.stillQueued
@@ -194,6 +202,50 @@ func (q *sendQueue) submit(req SendMessageRequest, cleanup func()) (job *sendJob
 	return job, pos, true
 }
 
+// submitOnce is submit honouring req.IdempotencyKey: if an earlier
+// submission with the same key is still queued or was sent, nothing is
+// queued and dup is that submission's result. Without a key it is exactly
+// submit.
+func (q *sendQueue) submitOnce(req SendMessageRequest, cleanup func()) (job *sendJob, pos queuePosition, dup *SendResult, ok bool) {
+	key := req.IdempotencyKey
+	if key == "" {
+		job, pos, ok = q.submit(req, cleanup)
+		return job, pos, nil, ok
+	}
+	q.keyedMu.Lock()
+	defer q.keyedMu.Unlock()
+	if prev, found := q.byKey(key); found && prev.State != sendFailed {
+		return nil, queuePosition{}, &prev, true
+	}
+	job, pos, ok = q.submit(req, cleanup)
+	if ok {
+		q.mu.Lock()
+		q.keys[key] = job.id
+		q.mu.Unlock()
+	}
+	return job, pos, nil, ok
+}
+
+// byKey finds the latest submission made with an idempotency key: in memory
+// first, then — for one from before a restart — in the durable store.
+func (q *sendQueue) byKey(key string) (SendResult, bool) {
+	q.mu.Lock()
+	id, ok := q.keys[key]
+	q.mu.Unlock()
+	if !ok && q.store != nil {
+		var err error
+		id, ok, err = q.store.findByKey(key)
+		if err != nil {
+			fmt.Printf("Send queue: failed to look up idempotency key: %v\n", err)
+			return SendResult{}, false
+		}
+	}
+	if !ok {
+		return SendResult{}, false
+	}
+	return q.result(id)
+}
+
 // estimateWait is what queuedMessage tells the caller to expect: the due
 // time already committed for a plain send; for a new contact, that plus a
 // rough allowance for the main queue's current backlog, since the main-queue
@@ -283,8 +335,14 @@ func (q *sendQueue) record(res SendResult) {
 	} else {
 		q.order = append(q.order, res.ID)
 		for len(q.order) > resultsKept {
-			delete(q.results, q.order[0])
+			evicted := q.order[0]
+			delete(q.results, evicted)
 			q.order = q.order[1:]
+			for key, id := range q.keys {
+				if id == evicted {
+					delete(q.keys, key)
+				}
+			}
 		}
 	}
 	q.results[res.ID] = res

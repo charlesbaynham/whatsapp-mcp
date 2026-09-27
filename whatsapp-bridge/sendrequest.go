@@ -38,6 +38,8 @@ func parseSendRequest(r *http.Request, storeDir string) (SendMessageRequest, fun
 		Recipient: r.FormValue("recipient"),
 		Message:   r.FormValue("message"),
 		MediaPath: r.FormValue("media_path"),
+
+		IdempotencyKey: r.FormValue("idempotency_key"),
 	}
 	if err := formBool(r, "voice_note", &req.VoiceNote); err != nil {
 		return req, noop, err

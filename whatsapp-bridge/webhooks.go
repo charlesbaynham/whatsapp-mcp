@@ -28,6 +28,13 @@ const (
 	webhookDefaultMaxPerHour  = 60
 )
 
+// webhookDebounceMaxWait caps how long a trailing debounce can keep putting
+// a delivery off: however steadily someone keeps typing, the batch goes out
+// this long after its first message (or after the debounce itself, if that
+// is set longer). A package-level var so tests can shorten it; overridden by
+// WHATSAPP_WEBHOOK_DEBOUNCE_MAX_WAIT_SECONDS.
+var webhookDebounceMaxWait = time.Duration(envPositiveInt("WHATSAPP_WEBHOOK_DEBOUNCE_MAX_WAIT_SECONDS", 300)) * time.Second
+
 // webhookCooldownDuration is how long a subscription is held after a failed
 // delivery before the next queued batch is attempted. A package-level var
 // (not a const) so tests can shorten it.
@@ -375,15 +382,18 @@ type httpDoer interface {
 }
 
 // WebhookDispatcher fans incoming WebhookEvents out to matching subscriptions,
-// coalescing per-subscription bursts (from debounce_seconds, and from a
-// post-failure cooldown) into a single delivery.
+// coalescing bursts (from debounce_seconds, and from a post-failure cooldown)
+// into a single delivery. Bursts are batched per subscription *and chat*, so
+// a wildcard subscription wakes once per conversation rather than lumping
+// unrelated chats together, and one chatty guest cannot hold everyone else's
+// delivery back.
 type WebhookDispatcher struct {
 	store  *MessageStore
 	client httpDoer
 	logger waLog.Logger
 
 	mu            sync.Mutex
-	pending       map[int64]*pendingBatch
+	pending       map[batchKey]*pendingBatch
 	cooldownUntil map[int64]time.Time
 
 	rateMu sync.Mutex
@@ -397,9 +407,18 @@ type WebhookDispatcher struct {
 	onWake func(chatJID string)
 }
 
+// batchKey identifies one pending batch: a subscription's events for one chat.
+type batchKey struct {
+	sub  int64
+	chat string
+}
+
 type pendingBatch struct {
 	events []WebhookEvent
 	timer  *time.Timer
+	// openedAt is when the batch's first event arrived; the trailing
+	// debounce never pushes delivery past openedAt + webhookDebounceMaxWait.
+	openedAt time.Time
 }
 
 // NewWebhookDispatcher builds a dispatcher using the real network by default.
@@ -408,7 +427,7 @@ func NewWebhookDispatcher(store *MessageStore, logger waLog.Logger) *WebhookDisp
 		store:         store,
 		client:        &http.Client{Timeout: webhookTimeout},
 		logger:        logger,
-		pending:       make(map[int64]*pendingBatch),
+		pending:       make(map[batchKey]*pendingBatch),
 		cooldownUntil: make(map[int64]time.Time),
 		hits:          make(map[int64][]time.Time),
 	}
@@ -448,59 +467,83 @@ func (d *WebhookDispatcher) dispatch(event WebhookEvent) {
 }
 
 // enqueueOrSend either fires immediately (no debounce, no active cooldown) or
-// folds the event into the subscription's pending batch, scheduled to flush
-// after the debounce window or the remaining cooldown, whichever is longer.
+// folds the event into the pending batch for its subscription and chat.
+//
+// The debounce is trailing: every new event restarts the window, so a batch
+// goes out once the chat has been quiet for debounce_seconds, not a fixed
+// time after its first message. (A fixed window split any burst that
+// happened to straddle it into two deliveries — two woken agents answering
+// the same conversation.) So that someone typing steadily is not kept
+// waiting forever, the window never extends past webhookDebounceMaxWait
+// from the batch's first event. An active cooldown still holds the batch
+// until it ends, whichever is later.
 func (d *WebhookDispatcher) enqueueOrSend(sub WebhookSubscription, event WebhookEvent) {
 	d.mu.Lock()
 
-	remaining := time.Duration(0)
+	now := time.Now()
+	var cooldownEnd time.Time
 	if until, ok := d.cooldownUntil[sub.ID]; ok {
-		if now := time.Now(); until.After(now) {
-			remaining = until.Sub(now)
+		if until.After(now) {
+			cooldownEnd = until
 		} else {
 			delete(d.cooldownUntil, sub.ID)
 		}
 	}
-	delay := time.Duration(sub.DebounceSeconds) * time.Second
-	if remaining > delay {
-		delay = remaining
-	}
+	debounce := time.Duration(sub.DebounceSeconds) * time.Second
+	key := batchKey{sub: sub.ID, chat: event.ChatJID}
 
-	if batch, ok := d.pending[sub.ID]; ok {
+	if batch, ok := d.pending[key]; ok {
 		batch.events = append(batch.events, event)
+		// If the timer has already fired, its flush is waiting on d.mu and
+		// will deliver this event with the rest; the re-armed timer then
+		// finds the batch gone (or replaced) and does nothing.
+		batch.timer.Reset(waitFrom(batchDueAt(now, batch.openedAt, debounce, cooldownEnd)))
 		d.mu.Unlock()
 		return
 	}
 
-	if delay <= 0 {
+	if debounce <= 0 && cooldownEnd.IsZero() {
 		d.mu.Unlock()
 		go d.attemptDelivery(sub, []WebhookEvent{event}, true)
 		return
 	}
 
-	id := sub.ID
-	batch := &pendingBatch{events: []WebhookEvent{event}}
-	batch.timer = time.AfterFunc(delay, func() { d.flush(id) })
-	d.pending[sub.ID] = batch
+	batch := &pendingBatch{events: []WebhookEvent{event}, openedAt: now}
+	batch.timer = time.AfterFunc(waitFrom(batchDueAt(now, now, debounce, cooldownEnd)), func() { d.flush(key, batch) })
+	d.pending[key] = batch
 	d.mu.Unlock()
 }
 
-// flush delivers a subscription's accumulated batch: the debounce window (or
-// cooldown) has elapsed, so this is the next delivery attempt.
-func (d *WebhookDispatcher) flush(id int64) {
-	d.mu.Lock()
-	batch, ok := d.pending[id]
-	if ok {
-		delete(d.pending, id)
+// batchDueAt is when a pending batch should go out, given that an event has
+// just arrived: debounce after now, but no later than the max wait from when
+// the batch opened, and never before an active cooldown ends.
+func batchDueAt(now, openedAt time.Time, debounce time.Duration, cooldownEnd time.Time) time.Time {
+	due := now.Add(debounce)
+	if limit := openedAt.Add(max(webhookDebounceMaxWait, debounce)); due.After(limit) {
+		due = limit
 	}
-	d.mu.Unlock()
-	if !ok {
+	if cooldownEnd.After(due) {
+		due = cooldownEnd
+	}
+	return due
+}
+
+// flush delivers a pending batch: its debounce window (or cooldown) has
+// elapsed, so this is the next delivery attempt. It acts only if batch is
+// still the one pending under key — a timer re-armed after it had already
+// fired must not deliver the next batch early.
+func (d *WebhookDispatcher) flush(key batchKey, batch *pendingBatch) {
+	d.mu.Lock()
+	if d.pending[key] != batch {
+		d.mu.Unlock()
 		return
 	}
+	delete(d.pending, key)
+	d.mu.Unlock()
 
-	sub, found, err := d.store.GetWebhookSubscription(id)
+	sub, found, err := d.store.GetWebhookSubscription(key.sub)
 	if err != nil {
-		d.logger.Warnf("webhook %d: failed to look up subscription for flush: %v", id, err)
+		d.logger.Warnf("webhook %d: failed to look up subscription for flush: %v", key.sub, err)
 		return
 	}
 	if !found || !sub.Enabled {
@@ -515,9 +558,11 @@ func (d *WebhookDispatcher) flush(id int64) {
 func (d *WebhookDispatcher) discardPending(id int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if batch, ok := d.pending[id]; ok {
-		batch.timer.Stop()
-		delete(d.pending, id)
+	for key, batch := range d.pending {
+		if key.sub == id {
+			batch.timer.Stop()
+			delete(d.pending, key)
+		}
 	}
 	delete(d.cooldownUntil, id)
 }

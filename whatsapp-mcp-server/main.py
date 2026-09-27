@@ -251,7 +251,8 @@ def get_message_context(
 def send_message(
     recipient: str,
     message: str,
-    block: bool = False
+    block: bool = False,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
@@ -280,6 +281,13 @@ def send_message(
                  outcome must be known before doing anything else. Refused
                  outright for a first contact (the wait would be hours):
                  resubmit without block and poll get_send_status instead.
+        idempotency_key: Optional. Makes the send happen at most once: if a
+                 message with this key is already queued or has gone out,
+                 nothing new is queued and the reply has `duplicate: true` with
+                 the earlier submission's id. Use a key that names the reply,
+                 not the attempt (e.g. the drafted message's own id), so two
+                 agents answering the same message cannot both send it. A failed
+                 send does not use the key up.
 
     Returns:
         A dictionary containing success status, a status message, and the
@@ -287,7 +295,10 @@ def send_message(
     """
     if not recipient:
         return {"success": False, "message": "Recipient must be provided"}
-    return _note_new_contact(_result(lambda: wa.send_message(recipient, message, block=block)))
+    kwargs: Dict[str, Any] = {"block": block}
+    if idempotency_key:
+        kwargs["idempotency_key"] = idempotency_key
+    return _note_new_contact(_result(lambda: wa.send_message(recipient, message, **kwargs)))
 
 
 class OutgoingMessage(BaseModel):
@@ -298,6 +309,10 @@ class OutgoingMessage(BaseModel):
         '(e.g. "123456789@s.whatsapp.net", or a group JID like "123456789@g.us")'
     ))
     message: str = Field(description="The message text to send")
+    idempotency_key: Optional[str] = Field(default=None, description=(
+        "Optional. Sends this message at most once: a repeat with the same key is not queued again "
+        "while the first is queued or sent (see send_message)"
+    ))
 
 
 @mcp.tool()
@@ -361,10 +376,13 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
             results.append({"recipient": item.recipient, "success": False,
                             "message": f"Not submitted: {halted}"})
             continue
-        out = _result(lambda i=item: wa.send_message(i.recipient, i.message))
+        out = _result(lambda i=item: wa.send_message(
+            i.recipient, i.message, **({"idempotency_key": i.idempotency_key} if i.idempotency_key else {})))
         ok = bool(out.get("success"))
         entry = {"recipient": item.recipient, "success": ok,
                  "id": out.get("id"), "message": out.get("message", "")}
+        if out.get("duplicate"):
+            entry["duplicate"] = True
         if out.get("new_contact"):
             entry["new_contact"] = True
         if "estimated_wait_seconds" in out:
@@ -756,8 +774,12 @@ def subscribe_chat(
         kind: "claude_routine" (default) or "generic"
         headers: Optional extra headers to send with each POST
         include_from_me: Whether to also fire for messages you sent (default False)
-        debounce_seconds: Minimum gap between fires for this subscription; recommended
-                 for busy chats so a burst of messages triggers one fire, not many
+        debounce_seconds: How long a chat must go quiet before its messages are
+                 delivered, as one batch; each new message restarts the wait, up
+                 to a cap of 5 minutes from the batch's first message. Batches
+                 are per chat, so a "*" subscription wakes once per conversation.
+                 Recommended for busy chats so a burst of messages triggers one
+                 fire, not many
         ttl_seconds: How long this subscription stays active, in seconds (0 = no
                  expiry, max 30 days = 2592000). Recommended for bounded tasks.
         max_per_hour: Maximum number of fires allowed per rolling hour (default 60)

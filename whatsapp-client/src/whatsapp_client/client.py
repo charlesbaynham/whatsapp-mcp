@@ -239,7 +239,9 @@ class WhatsAppClient:
 
     # --- sending ---
 
-    def send_message(self, recipient: str, message: str, *, block: bool = False) -> Dict[str, Any]:
+    def send_message(
+        self, recipient: str, message: str, *, block: bool = False, idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Queue a message. Returns `{success, queued, id, ahead,
         estimated_wait_seconds}` once accepted, plus ``new_contact: True`` for a
         recipient the bridge has never had a chat with — those are held in a
@@ -249,9 +251,16 @@ class WhatsAppClient:
         outcome instead; for a first contact it is refused (BridgeError, status
         422) rather than held for hours. Either way the id can be passed to
         `send_status`.
+
+        ``idempotency_key`` makes the send happen at most once: if a send with
+        the same key is already queued or has gone out, nothing is queued and
+        the reply carries ``duplicate: True`` and that earlier submission's id.
+        A failed send does not use the key up.
         """
-        return self._json("POST", "/send", timeout=self._send_timeout(block), ok=SEND_OK,
-                          json={"recipient": recipient, "message": message, "block": block})
+        body: Dict[str, Any] = {"recipient": recipient, "message": message, "block": block}
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key
+        return self._json("POST", "/send", timeout=self._send_timeout(block), ok=SEND_OK, json=body)
 
     def send_poll(
         self,

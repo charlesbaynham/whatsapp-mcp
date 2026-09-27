@@ -31,6 +31,16 @@ func roughDuration(d time.Duration) string {
 	}
 }
 
+// duplicateMessage explains a send refused by its idempotency key: the
+// earlier submission it matched, and where that one is now.
+func duplicateMessage(prev SendResult) string {
+	if prev.State == sendSent {
+		return fmt.Sprintf("Not sent again: a message with this idempotency_key already went out as %s at %s",
+			prev.ID, prev.SentAt.Format(time.RFC3339))
+	}
+	return fmt.Sprintf("Not queued again: a message with this idempotency_key is already queued as %s; poll that id for its outcome", prev.ID)
+}
+
 // blockedFirstContactMessage is the refusal for a blocking send to a first
 // contact. Such a send is held for hours by the new-contact queue, far past
 // any caller's patience, so rather than accept it and let the caller time out
@@ -113,7 +123,20 @@ func sendHandler(queue *sendQueue, storeDir string, ready func(http.ResponseWrit
 			}
 		}
 
-		job, pos, queued := queue.submit(req, cleanup)
+		job, pos, dup, queued := queue.submitOnce(req, cleanup)
+		if dup != nil {
+			fmt.Printf("Not re-sending: idempotency key already used by %s (%s)\n", dup.ID, dup.State)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success:    true,
+				Duplicate:  true,
+				ID:         dup.ID,
+				Queued:     dup.State == sendQueued,
+				NewContact: dup.NewContact,
+				Message:    duplicateMessage(*dup),
+			})
+			return
+		}
 		if !queued {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
