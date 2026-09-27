@@ -1,6 +1,7 @@
 """Tool-level tests: the MCP tools are thin wrappers, so these check error
 folding and the few places the server reshapes bridge output."""
 
+import base64
 import unittest
 from unittest import mock
 
@@ -146,6 +147,36 @@ class ReshapeTests(unittest.TestCase):
             self.assertEqual(main.download_media("m", "c")["file_path"], "/data/store/x")
         with mock.patch.object(main.wa, "download_media", side_effect=BridgeError("nope")):
             self.assertFalse(main.download_media("m", "c")["success"])
+
+    def test_view_media_returns_the_image(self):
+        with mock.patch.object(main.wa, "get_media", return_value=(b"\xff\xd8jpeg", "image/jpeg")) as gm:
+            out = main.view_media("m", "447700900000:24@s.whatsapp.net")
+        gm.assert_called_once_with("447700900000:24@s.whatsapp.net", "m")
+        self.assertIsInstance(out, main.Image)
+        content = out.to_image_content()
+        self.assertEqual(content.mimeType, "image/jpeg")
+        self.assertEqual(base64.b64decode(content.data), b"\xff\xd8jpeg")
+
+    def test_view_media_accepts_a_content_type_with_parameters(self):
+        with mock.patch.object(main.wa, "get_media", return_value=(b"x", "image/webp; charset=binary")):
+            self.assertIsInstance(main.view_media("m", "c"), main.Image)
+
+    def test_view_media_refuses_non_images(self):
+        with mock.patch.object(main.wa, "get_media", return_value=(b"%PDF", "application/pdf")):
+            out = main.view_media("m", "c")
+        self.assertFalse(out["success"])
+        self.assertIn("application/pdf", out["message"])
+
+    def test_view_media_refuses_oversize_images(self):
+        big = b"x" * (main.MAX_VIEW_BYTES + 1)
+        with mock.patch.object(main.wa, "get_media", return_value=(big, "image/png")):
+            self.assertFalse(main.view_media("m", "c")["success"])
+
+    def test_view_media_folds_bridge_errors(self):
+        with mock.patch.object(main.wa, "get_media", side_effect=BridgeError("failed to find message", status=404)):
+            out = main.view_media("m", "c")
+        self.assertEqual(out["success"], False)
+        self.assertIn("failed to find message", out["message"])
 
 
 class BatchSendTests(unittest.TestCase):

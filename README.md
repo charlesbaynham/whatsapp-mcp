@@ -291,7 +291,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **list_polls**: List polls, newest first, each with its current tally
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
-- **download_media**: Download media from a WhatsApp message and get the local file path
+- **download_media**: Download media from a WhatsApp message into the bridge's store and get its path (on the bridge host)
+- **view_media**: Return an image from a WhatsApp message as image content, so a remote agent can see it
 - **mark_chat_read**: Explicitly mark a chat as read, optionally sending real read receipts
 - **start_typing**: Show "typing…" in a chat while a reply is being worked out (the bridge starts this by itself when a message wakes an agent; this extends it)
 - **stop_typing**: Take "typing…" away again when the decision turns out to be not to reply

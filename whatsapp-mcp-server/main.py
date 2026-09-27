@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from whatsapp_client import BridgeError, BridgeUnavailable, WhatsAppClient
 
 MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
@@ -682,7 +682,10 @@ def send_audio_message(recipient: str, media_path: str, block: bool = False) -> 
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
+    """Download media from a WhatsApp message into the bridge's store and get its path.
+
+    The path is on the bridge's host, not the caller's: an agent running
+    elsewhere cannot open it. To look at an image, use view_media instead.
 
     Args:
         message_id: The ID of the message containing the media
@@ -698,6 +701,43 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     if out.get("success"):
         return {"success": True, "message": "Media downloaded successfully", "file_path": out.get("path")}
     return {"success": False, "message": out.get("message", "Failed to download media")}
+
+
+# The Claude API refuses images over 5 MB; WhatsApp compresses photos well
+# below that, so only an uncompressed "document" image should ever trip it.
+MAX_VIEW_BYTES = 5 * 1024 * 1024
+VIEWABLE_TYPES = {"image/jpeg": "jpeg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+
+
+@mcp.tool()
+def view_media(message_id: str, chat_jid: str) -> Any:
+    """Look at an image (photo or sticker) sent in a WhatsApp message.
+
+    Returns the image itself, so the calling model can see it; download_media
+    only returns a path on the bridge's host, which a remote agent cannot
+    open. Voice notes need no such step: their text is already in the
+    message's `transcript`. Other attachments (PDFs, video, documents) are
+    refused with their type.
+
+    Args:
+        message_id: The ID of the message containing the image
+        chat_jid: The JID of the chat containing the message, exactly as
+            list_messages reports it (a device-suffixed JID such as
+            `447700900000:24@s.whatsapp.net` must be passed as is)
+    """
+    try:
+        data, content_type = wa.get_media(chat_jid, message_id)
+    except BridgeError as e:
+        return {"success": False, "message": f"Failed to fetch media: {e}"}
+    content_type = content_type.split(";")[0].strip().lower()
+    fmt = VIEWABLE_TYPES.get(content_type)
+    if fmt is None:
+        return {"success": False, "message": f"Not a viewable image (content type {content_type}); "
+                                             "use download_media to store it on the bridge"}
+    if len(data) > MAX_VIEW_BYTES:
+        return {"success": False, "message": f"Image is {len(data) / 1e6:.1f} MB, over the "
+                                             f"{MAX_VIEW_BYTES / 1e6:.0f} MB a model can be shown"}
+    return Image(data=data, format=fmt)
 
 
 @mcp.tool()
