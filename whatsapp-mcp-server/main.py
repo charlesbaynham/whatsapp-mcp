@@ -5,12 +5,19 @@ touches the store directory and never runs ffmpeg; the bridge does all of
 that behind its Unix socket (or TCP loopback port on a laptop).
 """
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
 import os
+import secrets
+import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from mcp.server.fastmcp import FastMCP
 from whatsapp_client import BridgeError, BridgeUnavailable, WhatsAppClient
@@ -24,6 +31,15 @@ MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 wa = WhatsAppClient(os.environ.get("WHATSAPP_BRIDGE_URL", "http://127.0.0.1:8080"))
 
 mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
+
+# media_link hands out URLs under this base, which must reach this server's
+# /media route from wherever the agent runs. Unset, the tool is disabled.
+MEDIA_PUBLIC_URL = os.environ.get("MEDIA_PUBLIC_URL", "").rstrip("/")
+# Signs media links. Without a configured secret a random one is drawn per
+# process, so outstanding links die with a restart; they are short-lived anyway.
+MEDIA_LINK_SECRET = os.environ.get("MEDIA_LINK_SECRET", "").encode() or secrets.token_bytes(32)
+MEDIA_LINK_DEFAULT_TTL = 900
+MEDIA_LINK_MAX_TTL = 86400
 
 
 # Mean gap the bridge holds between first contacts, for the warning below. The
@@ -90,6 +106,59 @@ async def health(_request: Request) -> JSONResponse:
         "paired": bool(status.get("logged_in")),
         "connected": bool(status.get("connected")),
     })
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _unb64(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _sign(payload: bytes) -> str:
+    return _b64(hmac.new(MEDIA_LINK_SECRET, payload, hashlib.sha256).digest())
+
+
+def make_media_token(chat_jid: str, message_id: str, expires_at: int) -> str:
+    """A self-contained capability for one message's media, valid until expires_at.
+
+    Stateless: the chat, message and expiry ride in the token under an HMAC,
+    so the server keeps no table of issued links.
+    """
+    payload = json.dumps({"c": chat_jid, "m": message_id, "e": expires_at}, separators=(",", ":")).encode()
+    return f"{_b64(payload)}.{_sign(payload)}"
+
+
+def read_media_token(token: str, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """The token's claims if its signature holds and it has not expired, else None."""
+    try:
+        body, sig = token.split(".", 1)
+        payload = _unb64(body)
+    except (ValueError, binascii.Error):
+        return None
+    if not hmac.compare_digest(sig, _sign(payload)):
+        return None
+    try:
+        claims = json.loads(payload)
+    except ValueError:
+        return None
+    if claims.get("e", 0) < (time.time() if now is None else now):
+        return None
+    return claims
+
+
+@mcp.custom_route("/media/{token}", methods=["GET"])
+async def media(request: Request) -> Response:
+    """Serve the media a media_link token names. The token is the only auth."""
+    claims = read_media_token(request.path_params["token"])
+    if claims is None:
+        return JSONResponse({"error": "invalid or expired link"}, status_code=403)
+    try:
+        data, content_type = wa.get_media(claims["c"], claims["m"])
+    except BridgeError as e:
+        return JSONResponse({"error": str(e)}, status_code=404 if e.status == 404 else 502)
+    return Response(data, media_type=content_type, headers={"Cache-Control": "private, no-store"})
 
 
 @mcp.tool()
@@ -682,7 +751,10 @@ def send_audio_message(recipient: str, media_path: str, block: bool = False) -> 
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
+    """Download media from a WhatsApp message into the bridge's store and get its path.
+
+    The path is on the bridge's host, not the caller's: an agent running
+    elsewhere cannot open it. To fetch the file itself, use media_link.
 
     Args:
         message_id: The ID of the message containing the media
@@ -698,6 +770,45 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     if out.get("success"):
         return {"success": True, "message": "Media downloaded successfully", "file_path": out.get("path")}
     return {"success": False, "message": out.get("message", "Failed to download media")}
+
+
+@mcp.tool()
+def media_link(message_id: str, chat_jid: str, ttl_seconds: int = MEDIA_LINK_DEFAULT_TTL) -> Dict[str, Any]:
+    """Get a short-lived URL from which the media in a WhatsApp message can be downloaded.
+
+    Nothing is put into context: fetch the URL (e.g. with curl) to save the
+    file where you run, then open it, or not, as the task needs. The URL
+    carries its own secret token, so treat it like a password and don't pass
+    it on. Voice notes rarely need this: their text is already in the
+    message's `transcript`.
+
+    Args:
+        message_id: The ID of the message containing the media
+        chat_jid: The JID of the chat containing the message, exactly as
+            list_messages reports it (a device-suffixed JID such as
+            `447700900000:24@s.whatsapp.net` must be passed as is)
+        ttl_seconds: How long the link stays valid (default 15 min, max 24 h)
+
+    Returns:
+        success, url, expires_at (ISO-8601 UTC) and the media's filename
+    """
+    if not MEDIA_PUBLIC_URL:
+        return {"success": False, "message": "media links are not configured on this server (MEDIA_PUBLIC_URL unset)"}
+    ttl = max(1, min(int(ttl_seconds), MEDIA_LINK_MAX_TTL))
+    # Download now so a bad id fails here rather than as a 404 on the URL.
+    try:
+        out = wa.download_media(message_id, chat_jid)
+    except BridgeError as e:
+        return {"success": False, "message": f"Failed to download media: {e}"}
+    if not out.get("success"):
+        return {"success": False, "message": out.get("message", "Failed to download media")}
+    expires_at = int(time.time()) + ttl
+    return {
+        "success": True,
+        "url": f"{MEDIA_PUBLIC_URL}/media/{make_media_token(chat_jid, message_id, expires_at)}",
+        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at)),
+        "filename": out.get("filename"),
+    }
 
 
 @mcp.tool()

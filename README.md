@@ -291,7 +291,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **list_polls**: List polls, newest first, each with its current tally
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
-- **download_media**: Download media from a WhatsApp message and get the local file path
+- **download_media**: Download media from a WhatsApp message into the bridge's store and get its path (on the bridge host)
+- **media_link**: Get a short-lived signed URL for a message's media, so an agent on another machine can download the file and decide whether to open it
 - **mark_chat_read**: Explicitly mark a chat as read, optionally sending real read receipts
 - **start_typing**: Show "typing…" in a chat while a reply is being worked out (the bridge starts this by itself when a message wakes an agent; this extends it)
 - **stop_typing**: Take "typing…" away again when the decision turns out to be not to reply
@@ -408,6 +409,8 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+An agent that runs elsewhere (a cloud session, say) can't open that path. `media_link` instead returns a URL of the form `<MEDIA_PUBLIC_URL>/media/<token>`, valid for 15 minutes by default (24 h at most), which serves the file over HTTP. The token is an HMAC over the chat, message and expiry, so it is the only credential the route checks: set `MEDIA_PUBLIC_URL` to a base URL the agent can reach, and have the ingress pass `/media/*` through without the MCP auth layer. `MEDIA_LINK_SECRET` fixes the signing key; without it a random key is drawn at startup, so a restart invalidates outstanding links.
 
 ## Technical Details
 

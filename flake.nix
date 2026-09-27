@@ -27,7 +27,7 @@
       # WhatsApp account is just a second template under a different name -
       # everything that makes it a separate account (the session, the message
       # mirror) lives on the container's own state volume, not in this image.
-      mkWhatsapp = name: cattle.lib.mkTemplate {
+      mkWhatsapp = name: extra: cattle.lib.mkTemplate {
         inherit nixpkgs system name;
         stateDir = "/data";
         modules = [
@@ -39,14 +39,18 @@
               clientSource = ./whatsapp-client;
               mcpSource = ./whatsapp-mcp-server;
               forwarderSource = ./hindsight-forwarder;
-            };
+            } // extra;
           }
         ];
       };
 
       templates = {
-        whatsapp = mkWhatsapp "whatsapp";
-        "charlesbot-whatsapp" = mkWhatsapp "charlesbot-whatsapp";
+        whatsapp = mkWhatsapp "whatsapp" { };
+        # media_link URLs need homelab-infra to route /media/ past mcp-auth
+        # (unauthenticated_paths); only this instance has that route.
+        "charlesbot-whatsapp" = mkWhatsapp "charlesbot-whatsapp" {
+          mediaPublicUrl = "https://charlesbot-whatsapp.houseabsolute.co.uk";
+        };
       };
     in
     {
