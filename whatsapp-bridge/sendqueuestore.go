@@ -67,6 +67,14 @@ func openSendQueueStore(storeDir string) (*sendQueueStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("creating sendqueue schema: %v", err)
 	}
+	if err := ensureColumn(db, "sendqueue_jobs", "idempotency_key", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("adding idempotency_key column: %v", err)
+	}
+	if _, err := db.Exec(sendQueueIndexes); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating sendqueue indexes: %v", err)
+	}
 	return &sendQueueStore{db: db, storeDir: storeDir}, nil
 }
 
@@ -91,9 +99,16 @@ CREATE TABLE IF NOT EXISTS sendqueue_jobs (
 	state TEXT NOT NULL DEFAULT 'queued',
 	success INTEGER NOT NULL DEFAULT 0,
 	outcome TEXT NOT NULL DEFAULT '',
-	sent_at TIMESTAMP
+	sent_at TIMESTAMP,
+	idempotency_key TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS sendqueue_jobs_state_stage ON sendqueue_jobs (state, stage, due_at);
+`
+
+// sendQueueIndexes are created after migrations, since they may name a
+// column an older database only gains there.
+const sendQueueIndexes = `
+CREATE INDEX IF NOT EXISTS sendqueue_jobs_idempotency_key ON sendqueue_jobs (idempotency_key) WHERE idempotency_key != '';
 `
 
 func (s *sendQueueStore) Close() error {
@@ -125,10 +140,12 @@ func (s *sendQueueStore) insertJob(job *sendJob, newContact bool, stage string, 
 	_, err := s.db.Exec(`
 		INSERT INTO sendqueue_jobs
 			(id, recipient, message, media_path, upload_name, voice_note, poll,
-			 new_contact, new_contact_due_at, stage, due_at, queued_at, state, success, outcome, sent_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', NULL)`,
+			 new_contact, new_contact_due_at, stage, due_at, queued_at, state, success, outcome, sent_at,
+			 idempotency_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', NULL, ?)`,
 		job.id, job.req.Recipient, job.req.Message, job.req.MediaPath, job.req.uploadName,
 		boolInt(job.req.VoiceNote), pollJSON, boolInt(newContact), newContactDueAt, stage, dueAt, queuedAt,
+		job.req.IdempotencyKey,
 	)
 	return err
 }
@@ -239,6 +256,20 @@ func (s *sendQueueStore) getResult(id string) (SendResult, bool, error) {
 		res.SentAt = sentAt.Time
 	}
 	return res, true, nil
+}
+
+// findByKey returns the id of the latest submission made with an
+// idempotency key, whatever its state.
+func (s *sendQueueStore) findByKey(key string) (string, bool, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM sendqueue_jobs WHERE idempotency_key = ? ORDER BY rowid DESC LIMIT 1`, key).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
 }
 
 // maxDueAt is the newest due time ever assigned to a row currently (or

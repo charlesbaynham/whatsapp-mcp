@@ -271,6 +271,147 @@ func TestDebounceCoalescesEvents(t *testing.T) {
 	}
 }
 
+// waitForRequests polls until rec has at least n requests or the deadline passes.
+func waitForRequests(rec *recordingServer, n int, within time.Duration) {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) && rec.count() < n {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A burst that runs past the debounce window measured from its first message,
+// with every gap shorter than the window, must still be one delivery: the
+// window restarts on each message. A fixed window from the first message
+// split exactly this into two deliveries, and so two woken agents.
+func TestDebounceIsTrailing(t *testing.T) {
+	store := newTestStore(t)
+	srv, rec := newRecordingServer(t, 200)
+
+	store.AddWebhookSubscription(WebhookSubscription{
+		ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindGeneric, Headers: map[string]string{}, Enabled: true, DebounceSeconds: 1,
+	})
+
+	d := testDispatcher(store)
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		d.dispatch(testEvent("111@s.whatsapp.net"))
+		time.Sleep(600 * time.Millisecond)
+	}
+	// Last event at ~1.2s, so the delivery is due at ~2.2s — well past the
+	// 1s a fixed window would have fired at.
+	if rec.count() != 0 {
+		t.Fatalf("delivered after %v, before the chat went quiet", time.Since(start))
+	}
+
+	waitForRequests(rec, 1, 3*time.Second)
+	time.Sleep(300 * time.Millisecond) // let any (incorrect) second POST land
+	if rec.count() != 1 {
+		t.Fatalf("got %d requests, want exactly 1", rec.count())
+	}
+	if events, _ := rec.requests[0].Body["events"].([]any); len(events) != 3 {
+		t.Fatalf("expected all 3 events in the one delivery, got %d", len(events))
+	}
+}
+
+// Someone typing steadily must not hold the delivery off forever: it goes
+// out at the max wait from the first message even though the chat never
+// went quiet.
+func TestDebounceMaxWaitCapsTrailingWindow(t *testing.T) {
+	store := newTestStore(t)
+	srv, rec := newRecordingServer(t, 200)
+
+	orig := webhookDebounceMaxWait
+	webhookDebounceMaxWait = 1500 * time.Millisecond
+	t.Cleanup(func() { webhookDebounceMaxWait = orig })
+
+	store.AddWebhookSubscription(WebhookSubscription{
+		ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindGeneric, Headers: map[string]string{}, Enabled: true, DebounceSeconds: 1,
+	})
+
+	d := testDispatcher(store)
+	start := time.Now()
+	var firstAt time.Duration
+	for time.Since(start) < 2500*time.Millisecond {
+		d.dispatch(testEvent("111@s.whatsapp.net"))
+		time.Sleep(300 * time.Millisecond)
+		if firstAt == 0 && rec.count() > 0 {
+			firstAt = time.Since(start)
+		}
+	}
+	if firstAt == 0 {
+		t.Fatalf("no delivery within 2.5s of steady typing; max wait is 1.5s")
+	}
+	if firstAt < 1400*time.Millisecond || firstAt > 2400*time.Millisecond {
+		t.Fatalf("first delivery at %v, want ~1.5s (the max wait)", firstAt)
+	}
+}
+
+// A wildcard subscription batches each chat separately: two conversations
+// in the same window are two deliveries, each carrying only its own chat.
+func TestDebounceBatchesPerChat(t *testing.T) {
+	store := newTestStore(t)
+	srv, rec := newRecordingServer(t, 200)
+
+	store.AddWebhookSubscription(WebhookSubscription{
+		ChatJID: "*", URL: srv.URL, Kind: webhookKindGeneric, Headers: map[string]string{}, Enabled: true, DebounceSeconds: 1,
+	})
+
+	d := testDispatcher(store)
+	d.dispatch(testEvent("111@s.whatsapp.net"))
+	d.dispatch(testEvent("222@s.whatsapp.net"))
+	d.dispatch(testEvent("111@s.whatsapp.net"))
+
+	waitForRequests(rec, 2, 3*time.Second)
+	time.Sleep(200 * time.Millisecond)
+	if rec.count() != 2 {
+		t.Fatalf("got %d requests, want one per chat (2)", rec.count())
+	}
+	sizes := map[int]bool{}
+	for _, req := range rec.requests {
+		events, _ := req.Body["events"].([]any)
+		chat := ""
+		for _, e := range events {
+			c := e.(map[string]any)["chat_jid"].(string)
+			if chat != "" && c != chat {
+				t.Fatalf("a delivery mixed chats %s and %s", chat, c)
+			}
+			chat = c
+		}
+		sizes[len(events)] = true
+	}
+	if !sizes[1] || !sizes[2] {
+		t.Fatalf("expected deliveries of 2 events (chat 111) and 1 event (chat 222), got sizes %v", sizes)
+	}
+}
+
+// batchDueAt: debounce after the latest event, capped by the max wait from
+// the first, and never before a cooldown ends.
+func TestBatchDueAt(t *testing.T) {
+	orig := webhookDebounceMaxWait
+	webhookDebounceMaxWait = 5 * time.Minute
+	t.Cleanup(func() { webhookDebounceMaxWait = orig })
+
+	t0 := time.Date(2026, 9, 27, 11, 3, 21, 0, time.UTC)
+	cases := []struct {
+		name     string
+		now      time.Time
+		debounce time.Duration
+		cooldown time.Time
+		want     time.Time
+	}{
+		{"trailing", t0.Add(61 * time.Second), time.Minute, time.Time{}, t0.Add(121 * time.Second)},
+		{"capped", t0.Add(4*time.Minute + 30*time.Second), time.Minute, time.Time{}, t0.Add(5 * time.Minute)},
+		{"cooldown later", t0, time.Minute, t0.Add(4 * time.Minute), t0.Add(4 * time.Minute)},
+		{"cooldown past cap", t0.Add(4 * time.Minute), time.Minute, t0.Add(7 * time.Minute), t0.Add(7 * time.Minute)},
+		{"debounce longer than cap", t0, 10 * time.Minute, time.Time{}, t0.Add(10 * time.Minute)},
+	}
+	for _, c := range cases {
+		if got := batchDueAt(c.now, t0, c.debounce, c.cooldown); !got.Equal(c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, got.Sub(t0), c.want.Sub(t0))
+		}
+	}
+}
+
 // --- Retry / auto-disable policy ---
 
 func TestFourOhFourDoesNotDisableOnFirstFailure(t *testing.T) {

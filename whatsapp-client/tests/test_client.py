@@ -93,6 +93,13 @@ class RequestShapeTests(unittest.TestCase):
         self.assertEqual(json.loads(rec.requests[0].content),
                          {"recipient": "447700900000", "message": "hello", "block": False})
 
+    def test_send_message_idempotency_key(self):
+        client, rec = make_client(lambda r: httpx.Response(
+            200, json={"success": True, "duplicate": True, "id": "snd-1"}))
+        out = client.send_message("447700900000", "hello", idempotency_key="reply-1")
+        self.assertTrue(out["duplicate"])
+        self.assertEqual(json.loads(rec.requests[0].content)["idempotency_key"], "reply-1")
+
     def test_send_poll_body(self):
         client, rec = make_client(lambda r: httpx.Response(202, json={"success": True, "queued": True, "id": "snd-1"}))
         out = client.send_poll("g@g.us", "Lunch?", ["Pizza", "Sushi"], selectable_count=0)

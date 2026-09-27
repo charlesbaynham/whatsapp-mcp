@@ -352,6 +352,10 @@ type SendMessageResponse struct {
 	// gates' means and the backlog at submission.
 	Ahead                int `json:"ahead,omitempty"`
 	EstimatedWaitSeconds int `json:"estimated_wait_seconds,omitempty"`
+	// Duplicate reports that a send with the same idempotency key was
+	// already accepted, so nothing new was queued: ID is that earlier
+	// submission, and Queued says whether it is still waiting.
+	Duplicate bool `json:"duplicate,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -369,6 +373,14 @@ type SendMessageRequest struct {
 	// how many a voter may pick. Votes are collected as they arrive and read
 	// back at GET /api/polls/{chat_jid}/{message_id}.
 	Poll *PollRequest `json:"poll,omitempty"`
+	// IdempotencyKey, when set, makes the send happen at most once: a second
+	// submission with the same key is not queued again while the first is
+	// still queued or has been sent — the caller gets the earlier
+	// submission's id back instead. A send that failed does not block a retry.
+	// It is how two agents racing to answer the same message avoid both
+	// sending the reply. Remembered as long as the submission's outcome is
+	// (a week, or the newest 500 finished sends).
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// uploadName is the original filename of a multipart upload, used as the
 	// document title instead of the temp file's name.
 	uploadName string

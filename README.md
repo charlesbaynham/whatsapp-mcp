@@ -196,6 +196,15 @@ its `success` was the send's own. It now reports only that the message was
 accepted; the send can still fail afterwards, and `GET /api/send/{id}` is how
 you find out. Pass `block: true` for the old behaviour.
 
+A send can carry an **`idempotency_key`**, which makes it happen at most once:
+a second submission with the same key, while the first is still queued or
+after it has gone out, queues nothing and returns `200` with `duplicate: true`
+and the first submission's `id`. A send that failed does not use its key up,
+so a retry goes through. Keys are remembered as long as the send's outcome is
+(a week, or the newest 500 finished sends), across restarts. It exists for two
+agents woken for the same conversation both deciding to send the same drafted
+reply — key it on the draft, not the attempt.
+
 This exists because WhatsApp unlinked a bridge's device mid-way through a burst
 of rapid first-contact messages: to their heuristics, a linked device sending
 back-to-back is a spammer.
@@ -333,7 +342,7 @@ Instead of polling, you can have the bridge push new messages to a URL as they a
 1. Create a Routine with an API trigger and copy its fire URL (`https://api.anthropic.com/v1/claude_code/routines/trig_.../fire`) and bearer token.
 2. Write the Routine's prompt so it explicitly opts in to acting on the payload, e.g. "When a `<routine-fire-payload>` block is present, read the new WhatsApp messages in it and act on them." A Routine whose prompt doesn't mention the fire payload will simply ignore it.
 3. Call `subscribe_chat(chat_jid="1234567890@s.whatsapp.net", url="https://api.anthropic.com/v1/claude_code/routines/trig_abc123/fire", bearer_token="<routine token>", debounce_seconds=60, ttl_seconds=3600)`.
-4. Every new message in that chat now starts a new Routine run. `debounce_seconds` is recommended for busy chats since each `POST` starts a fresh run — without it, a burst of messages triggers a burst of runs. `ttl_seconds=3600` here means the subscription stops itself after an hour.
+4. Every new message in that chat now starts a new Routine run. `debounce_seconds` is recommended for busy chats since each `POST` starts a fresh run — without it, a burst of messages triggers a burst of runs. The debounce is trailing and per chat: a chat's messages are delivered together once it has been quiet for `debounce_seconds`, with each new message restarting the wait, but never more than 5 minutes after the batch's first message (`WHATSAPP_WEBHOOK_DEBOUNCE_MAX_WAIT_SECONDS`), so someone typing steadily still gets an answer. `ttl_seconds=3600` here means the subscription stops itself after an hour.
 5. Use `test_subscription(subscription_id)` to confirm the fire URL accepts requests before relying on it live.
 
 ### Typing indicators
