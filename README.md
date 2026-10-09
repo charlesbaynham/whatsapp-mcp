@@ -355,13 +355,14 @@ the bridge shows "typing…" in the chat for the duration.
 
 It starts by itself, without anyone asking: when an incoming message matches
 a `claude_routine` subscription — a subscription whose whole purpose is that
-an agent answers that chat — the bridge sends the composing chatstate at the
-moment the message lands, and repeats it every few seconds (WhatsApp drops
-the indicator within seconds of the last one). That is well before the woken
-session exists, which is the point: with `debounce_seconds` set, the wake
-itself can be a minute away. A `generic` subscription makes no promise that
-anyone is replying, so it gets no indicator, and `WHATSAPP_BRIDGE_TYPING=off`
-turns the feature off entirely.
+an agent answers that chat — the bridge sends the composing chatstate as soon
+as the message has been delivered to that webhook, and repeats it every few
+seconds (WhatsApp drops the indicator within seconds of the last one). That is
+after the `debounce_seconds` window, while the guest may still be typing
+themselves, but before the woken session exists, which can take a while to
+spin up. A delivery that fails wakes nobody and starts nothing. A `generic`
+subscription makes no promise that anyone is replying, so it gets no
+indicator, and `WHATSAPP_BRIDGE_TYPING=off` turns the feature off entirely.
 
 Every hold ends, three ways:
 

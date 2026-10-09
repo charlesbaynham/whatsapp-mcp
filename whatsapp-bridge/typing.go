@@ -225,9 +225,9 @@ func (m *typingManager) List() []TypingStatus {
 }
 
 // WakeForChat is the hook the webhook dispatcher calls when an incoming
-// message is about to wake an agent: the guest should see "typing…" from the
-// moment their message lands, not from whenever the woken session gets round
-// to its first tool call.
+// message has just been delivered to wake an agent: the guest should see
+// "typing…" from the moment the agent is woken (after the debounce window),
+// not from whenever the woken session gets round to its first tool call.
 func (m *typingManager) WakeForChat(chatJID string) {
 	if m == nil || !m.enabled || chatJID == "" {
 		return
