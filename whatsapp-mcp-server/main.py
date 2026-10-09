@@ -849,9 +849,10 @@ def subscribe_chat(
       using `headers` for any extra headers it needs beyond the bearer token.
 
     A claude_routine subscription also makes the bridge show "typing..." in
-    the chat from the moment an incoming message arrives, since the point of
-    the subscription is that an agent answers it -- including through the
-    debounce window, before the woken session exists. The woken session owns
+    the chat once an incoming message has been delivered to the webhook
+    (after any debounce window), since the point of the subscription is that
+    an agent answers it -- covering the wait before the woken session exists.
+    The woken session owns
     that indicator from then on: it is cleared when the reply is sent, by
     stop_typing when the decision is not to reply, and by its own deadline if
     the session dies. kind="generic" gets no indicator.

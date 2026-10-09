@@ -401,63 +401,121 @@ func TestTypingRouteSaysSoWhenTheFeatureIsOff(t *testing.T) {
 
 // --- The webhook hook ---
 
-func TestDispatchStartsTypingForAnAgentSubscription(t *testing.T) {
+// wakeRecorder is an onWake that remembers which chats it was called for.
+type wakeRecorder struct {
+	mu    sync.Mutex
+	chats []string
+}
+
+func (w *wakeRecorder) wake(chatJID string) {
+	w.mu.Lock()
+	w.chats = append(w.chats, chatJID)
+	w.mu.Unlock()
+}
+
+func (w *wakeRecorder) got() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.chats...)
+}
+
+func addTestSub(t *testing.T, store *MessageStore, sub WebhookSubscription) WebhookSubscription {
+	t.Helper()
+	sub.Headers = map[string]string{}
+	sub.Enabled = true
+	got, err := store.AddWebhookSubscription(sub)
+	if err != nil {
+		t.Fatalf("AddWebhookSubscription: %v", err)
+	}
+	return got
+}
+
+func TestDeliveryStartsTypingForAnAgentSubscription(t *testing.T) {
 	store := newTestStore(t)
 	srv, _ := newRecordingServer(t, 200)
-	store.AddWebhookSubscription(WebhookSubscription{
-		ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindClaudeRoutine,
-		Headers: map[string]string{}, Enabled: true,
-	})
+	sub := addTestSub(t, store, WebhookSubscription{ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindClaudeRoutine})
 
 	d := testDispatcher(store)
-	var mu sync.Mutex
-	var woke []string
-	d.onWake = func(chatJID string) {
-		mu.Lock()
-		woke = append(woke, chatJID)
-		mu.Unlock()
+	rec := &wakeRecorder{}
+	d.onWake = rec.wake
+
+	// Two messages from one chat in a batch wake it once.
+	if _, err := d.attemptDelivery(sub, []WebhookEvent{testEvent("111@s.whatsapp.net"), testEvent("111@s.whatsapp.net")}, true); err != nil {
+		t.Fatalf("attemptDelivery: %v", err)
 	}
-
-	d.dispatch(testEvent("111@s.whatsapp.net"))
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(woke) != 1 || woke[0] != "111@s.whatsapp.net" {
-		t.Fatalf("onWake called with %v, want the one chat", woke)
+	if got := rec.got(); len(got) != 1 || got[0] != "111@s.whatsapp.net" {
+		t.Fatalf("onWake called with %v, want the one chat once", got)
 	}
 }
 
-func TestDispatchDoesNotStartTypingForGenericOrOwnMessages(t *testing.T) {
+func TestTypingWaitsForTheDebouncedDelivery(t *testing.T) {
+	store := newTestStore(t)
+	srv, recSrv := newRecordingServer(t, 200)
+	addTestSub(t, store, WebhookSubscription{ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindClaudeRoutine, DebounceSeconds: 60})
+
+	d := testDispatcher(store)
+	rec := &wakeRecorder{}
+	d.onWake = rec.wake
+
+	d.dispatch(testEvent("111@s.whatsapp.net"))
+	if got := rec.got(); len(got) != 0 {
+		t.Fatalf("typing started before delivery: %v", got)
+	}
+
+	d.mu.Lock()
+	var key batchKey
+	var batch *pendingBatch
+	for k, b := range d.pending {
+		key, batch = k, b
+	}
+	d.mu.Unlock()
+	if batch == nil {
+		t.Fatal("expected a pending batch")
+	}
+	batch.timer.Stop()
+	d.flush(key, batch)
+
+	if recSrv.count() != 1 {
+		t.Fatalf("deliveries=%d, want 1", recSrv.count())
+	}
+	if got := rec.got(); len(got) != 1 || got[0] != "111@s.whatsapp.net" {
+		t.Fatalf("onWake called with %v after flush, want the one chat", got)
+	}
+}
+
+func TestFailedDeliveryDoesNotStartTyping(t *testing.T) {
+	store := newTestStore(t)
+	srv, _ := newRecordingServer(t, 500)
+	sub := addTestSub(t, store, WebhookSubscription{ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindClaudeRoutine})
+
+	d := testDispatcher(store)
+	rec := &wakeRecorder{}
+	d.onWake = rec.wake
+
+	d.attemptDelivery(sub, []WebhookEvent{testEvent("111@s.whatsapp.net")}, true)
+	if got := rec.got(); len(got) != 0 {
+		t.Fatalf("onWake called with %v after a failed delivery, want none", got)
+	}
+}
+
+func TestDeliveryDoesNotStartTypingForGenericOrOwnMessages(t *testing.T) {
 	store := newTestStore(t)
 	srv, _ := newRecordingServer(t, 200)
 	// A generic consumer is a listener, not something that answers.
-	store.AddWebhookSubscription(WebhookSubscription{
-		ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindGeneric,
-		Headers: map[string]string{}, Enabled: true,
-	})
-	store.AddWebhookSubscription(WebhookSubscription{
-		ChatJID: "222@s.whatsapp.net", URL: srv.URL, Kind: webhookKindClaudeRoutine,
-		Headers: map[string]string{}, Enabled: true, IncludeFromMe: true,
-	})
+	generic := addTestSub(t, store, WebhookSubscription{ChatJID: "111@s.whatsapp.net", URL: srv.URL, Kind: webhookKindGeneric})
+	agent := addTestSub(t, store, WebhookSubscription{ChatJID: "222@s.whatsapp.net", URL: srv.URL, Kind: webhookKindClaudeRoutine, IncludeFromMe: true})
 
 	d := testDispatcher(store)
-	var mu sync.Mutex
-	woke := 0
-	d.onWake = func(string) {
-		mu.Lock()
-		woke++
-		mu.Unlock()
-	}
+	rec := &wakeRecorder{}
+	d.onWake = rec.wake
 
-	d.dispatch(testEvent("111@s.whatsapp.net"))
+	d.attemptDelivery(generic, []WebhookEvent{testEvent("111@s.whatsapp.net")}, true)
 	ownMessage := testEvent("222@s.whatsapp.net")
 	ownMessage.IsFromMe = true
-	d.dispatch(ownMessage)
+	d.attemptDelivery(agent, []WebhookEvent{ownMessage}, true)
 
-	mu.Lock()
-	defer mu.Unlock()
-	if woke != 0 {
-		t.Fatalf("onWake called %d times, want none", woke)
+	if got := rec.got(); len(got) != 0 {
+		t.Fatalf("onWake called with %v, want none", got)
 	}
 }
 
