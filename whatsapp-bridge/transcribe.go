@@ -398,6 +398,7 @@ func (store *MessageStore) messageEvent(chatJID, messageID string) (WebhookEvent
 	if ev.MediaType == "audio" {
 		ev.DurationSeconds = store.audioDuration(chatJID, messageID)
 	}
+	ev.ReplyTo = store.replyRefFor(chatJID, messageID)
 	return ev, true, nil
 }
 

@@ -134,6 +134,14 @@ class ReshapeTests(unittest.TestCase):
             out = main.get_last_interaction("g@g.us")
         self.assertIn("[poll] Lunch? — options: Pizza / Sushi — Pizza 2, Sushi 0 (2 voters)", out)
 
+    def test_last_interaction_formats_reply(self):
+        msg = {"id": "r1", "chat_jid": "c@s.whatsapp.net", "chat_name": "Carol", "sender_name": "Carol",
+               "timestamp": "2026-10-23T10:00:00Z", "content": "yes please",
+               "reply_to": {"id": "q1", "sender": "4477", "sender_name": "Me", "content": "Bus at 2:30?"}}
+        with mock.patch.object(main.wa, "get_last_interaction", return_value=msg):
+            out = main.get_last_interaction("c@s.whatsapp.net")
+        self.assertIn('(replying to Me [q1]: "Bus at 2:30?") yes please', out)
+
     def test_last_interaction_none(self):
         with mock.patch.object(main.wa, "get_last_interaction", return_value=None):
             self.assertIsNone(main.get_last_interaction("x"))

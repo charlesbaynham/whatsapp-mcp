@@ -38,6 +38,8 @@ type MessageView struct {
 	TranscriptionStatus string `json:"transcription_status,omitempty"`
 	// Poll is set for media_type "poll": the question, options and current tally.
 	Poll *PollView `json:"poll,omitempty"`
+	// ReplyTo is set when the message is a reply to (quotes) an earlier one.
+	ReplyTo *ReplyRef `json:"reply_to,omitempty"`
 }
 
 // ChatView is one chat as the read API returns it.
@@ -92,14 +94,20 @@ func clampPage(limit, page int) (int, int) {
 }
 
 const messageSelectColumns = `m.id, m.chat_jid, COALESCE(c.name, ''), m.sender, COALESCE(m.content, ''), m.timestamp, m.is_from_me,
-	COALESCE(m.media_type, ''), COALESCE(m.filename, ''), COALESCE(m.transcript, ''), COALESCE(m.transcription_status, ''), COALESCE(m.poll, '')`
+	COALESCE(m.media_type, ''), COALESCE(m.filename, ''), COALESCE(m.transcript, ''), COALESCE(m.transcription_status, ''), COALESCE(m.poll, ''),
+	m.reply_to_id, m.reply_to_sender, m.reply_to_content, m.reply_to_media_type, m.reply_to_chat_jid`
 
 func scanMessageView(row interface{ Scan(dest ...any) error }) (MessageView, error) {
 	var v MessageView
 	var ts sql.NullTime
 	var poll string
-	if err := row.Scan(&v.ID, &v.ChatJID, &v.ChatName, &v.Sender, &v.Content, &ts, &v.IsFromMe, &v.MediaType, &v.Filename, &v.Transcript, &v.TranscriptionStatus, &poll); err != nil {
+	var r ReplyRef
+	if err := row.Scan(&v.ID, &v.ChatJID, &v.ChatName, &v.Sender, &v.Content, &ts, &v.IsFromMe, &v.MediaType, &v.Filename, &v.Transcript, &v.TranscriptionStatus, &poll,
+		&r.ID, &r.Sender, &r.Content, &r.MediaType, &r.ChatJID); err != nil {
 		return MessageView{}, err
+	}
+	if r.ID != "" {
+		v.ReplyTo = &r
 	}
 	if ts.Valid {
 		v.Timestamp = ts.Time
@@ -215,7 +223,22 @@ func (n *senderNamer) lookup(sender string) string {
 func (n *senderNamer) fill(msgs []MessageView) {
 	for i := range msgs {
 		msgs[i].SenderName = n.name(msgs[i].Sender, msgs[i].IsFromMe)
+		n.fillReply(msgs[i].ReplyTo)
 	}
+}
+
+// fillReply names the author of a quoted message.
+func (n *senderNamer) fillReply(r *ReplyRef) {
+	if r == nil || r.Sender == "" {
+		return
+	}
+	r.SenderName = n.name(r.Sender, n.isMe(r.Sender))
+}
+
+// nameReply returns r with its sender named, for one-off events.
+func (store *MessageStore) nameReply(r *ReplyRef) *ReplyRef {
+	store.newSenderNamer().fillReply(r)
+	return r
 }
 
 func (store *MessageStore) queryMessages(where string, order string, args ...any) ([]MessageView, error) {

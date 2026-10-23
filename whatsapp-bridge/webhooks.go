@@ -138,6 +138,8 @@ type WebhookEvent struct {
 	Poll *PollView `json:"poll,omitempty"`
 	// PollVote is set on a poll.vote event: the vote and the poll's new tally.
 	PollVote *PollVotePayload `json:"poll_vote,omitempty"`
+	// ReplyTo is set when the message is a reply to (quotes) an earlier one.
+	ReplyTo *ReplyRef `json:"reply_to,omitempty"`
 }
 
 // createWebhookSubscriptionsTable is called from NewMessageStore alongside the other tables.
@@ -818,6 +820,9 @@ func buildWebhookText(events []WebhookEvent) string {
 		who := e.Sender
 		if !sameChat {
 			who = fmt.Sprintf("%s (%s)", e.ChatName, e.Sender)
+		}
+		if e.ReplyTo != nil {
+			who += " " + describeReplyTo(e.ReplyTo)
 		}
 		fmt.Fprintf(&b, "[%s] %s: %s\n", ts, who, content)
 	}

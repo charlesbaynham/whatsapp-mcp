@@ -44,9 +44,17 @@ in the new-contact queue in front of it.
 
 `Message`: `id, chat_jid, chat_name, sender, sender_name, content, timestamp
 (RFC 3339), is_from_me, media_type?, filename?, transcript?,
-transcription_status?, poll?`. `content` is what WhatsApp delivered (empty for a
+transcription_status?, poll?, reply_to?`. `content` is what WhatsApp delivered (empty for a
 voice note); `transcript` is the spoken text; `transcription_status` is
 `ok`, `pending`, `failed`, `timeout` or `disabled`.
+
+`reply_to` (set when the message quotes an earlier one — a swipe-to-reply):
+`id, sender?, sender_name?, content?, media_type?, chat_jid?`. `id` is the
+quoted message's id (look it up with `/messages/{id}/context`); `content` and
+`media_type` are WhatsApp's own copy of the quoted message, so they are there
+even when the original predates the store; `chat_jid` is set only when the
+quoted message is in another chat ("reply privately" to a group message).
+Messages stored before this field existed have no `reply_to`.
 
 `Poll` (the `poll` field of a `media_type: poll` message, whose `content` is
 the question): `question, options, selectable_count (1 = single choice, 0 =
@@ -99,7 +107,7 @@ pass), `types` (comma-separated), `include_from_me` (default false).
 
 | Event | Data | When |
 | --- | --- | --- |
-| `message.new` | message (`message_id, chat_jid, chat_name, sender, sender_name, content, timestamp, is_from_me, media_type?, filename?, has_media, transcript?, transcription_status?, duration_seconds?, poll?`) | A message became publishable. A voice note is published once, after transcription (or after the transcription timeout), never as media first and text later. A poll carries its `poll` (question, options, empty tally). |
+| `message.new` | message (`message_id, chat_jid, chat_name, sender, sender_name, content, timestamp, is_from_me, media_type?, filename?, has_media, transcript?, transcription_status?, duration_seconds?, poll?, reply_to?`) | A message became publishable. A reply carries `reply_to` (see `Message`), and the routine-facing `text` shows it inline as `(replying to <name> [<id>]: "<quoted>")`. A voice note is published once, after transcription (or after the transcription timeout), never as media first and text later. A poll carries its `poll` (question, options, empty tally). |
 | `message.updated` | same | An on-demand transcription finished |
 | `poll.vote` | same envelope, `sender` being the voter, plus `poll_vote: {poll_id, question, selected, results, total_voters}` | Someone voted on (or withdrew their vote from) a poll the bridge knows. `results` is the whole poll's tally after this vote. Fires webhooks like a message; not stored as a message. |
 | `chat.read` | `{chat_jid, up_to, source: api\|receipt\|app_state}` | Read marker advanced |
