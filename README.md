@@ -302,6 +302,16 @@ Claude can access the following tools to interact with WhatsApp:
 - **list_subscriptions**: List all subscriptions (bearer tokens are masked, only a 4-character hint is shown)
 - **test_subscription**: Send a one-off test event to a subscription's URL to confirm it's wired correctly
 
+### Replies
+
+When a message is a reply (WhatsApp's swipe-to-reply, quoting an earlier
+message), it carries `reply_to`: the quoted message's `id`, its `sender` /
+`sender_name` (`"Me"` for the bridge's own account), and `content` /
+`media_type` copied from the quote itself, so it is readable even when the
+original isn't in the store. Pass the `id` to `get_message_context` for the
+surrounding conversation. Webhook text shows it inline:
+`[time] 4477…: (replying to Me [3EB0…]: "Bus at 2:30?") yes please`.
+
 ### Polls
 
 `send_poll(recipient, question, options, selectable_count=1)` queues a poll

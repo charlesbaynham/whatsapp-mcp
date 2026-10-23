@@ -193,6 +193,13 @@ def list_messages(
     and a `poll` object with the options and the current tally (see
     get_poll_results for the per-voter detail).
 
+    A message that replies to (quotes) an earlier one carries `reply_to`:
+    `{id, sender, sender_name, content, media_type, chat_jid?}` -- the quoted
+    message's id and author ("Me" for this account) and WhatsApp's copy of
+    its text. Read a reply against what it quotes, not just the message
+    before it; get_message_context(reply_to.id) shows the quoted message in
+    place. `chat_jid` is set only when the quote is from another chat.
+
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
@@ -297,6 +304,8 @@ def get_last_interaction(jid: str) -> Optional[str]:
         body = f"[voice note] {msg['transcript']}"
     if msg.get("poll"):
         body = _describe_poll(msg["poll"])
+    if msg.get("reply_to"):
+        body = f"{_describe_reply(msg['reply_to'])} {body}"
     return f"[{msg['timestamp']}] Chat: {msg.get('chat_name') or msg['chat_jid']} From: {msg['sender_name']}: {prefix}{body}\n"
 
 
@@ -307,6 +316,8 @@ def get_message_context(
     after: int = 5
 ) -> Optional[Dict[str, Any]]:
     """Get context around a specific WhatsApp message.
+
+    Use it with a message's `reply_to.id` to see the message being replied to.
 
     Args:
         message_id: The ID of the message to get context for
@@ -483,6 +494,19 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
             "that is merely still queued, and poll get_send_status with an id if they need to know once it has gone."
         )
     return reply
+
+
+def _describe_reply(reply: Dict[str, Any]) -> str:
+    """Inline marker for a reply, matching the bridge's webhook text."""
+    who = reply.get("sender_name") or reply.get("sender") or "unknown"
+    quoted = reply.get("content") or ""
+    if len(quoted) > 120:
+        quoted = quoted[:120] + "…"
+    if reply.get("media_type"):
+        quoted = f"[{reply['media_type']}] \"{quoted}\"" if quoted else f"[{reply['media_type']}]"
+    else:
+        quoted = f"\"{quoted}\""
+    return f"(replying to {who} [{reply.get('id', '')}]: {quoted})"
 
 
 def _describe_poll(poll: Dict[str, Any]) -> str:

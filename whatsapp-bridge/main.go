@@ -115,6 +115,10 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureReplyColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	for col, ddl := range map[string]string{"transcript": "TEXT", "transcription_status": "TEXT NOT NULL DEFAULT ''"} {
 		if err := ensureColumn(db, "messages", col, ddl); err != nil {
 			db.Close()
@@ -755,6 +759,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 			logger.Warnf("Failed to store poll: %v", err)
 		}
 	}
+	replyTo := extractReplyTo(ctx, client.Store, msg.Message, chat)
+	if err := messageStore.SetReplyTo(msg.Info.ID, chatJID, replyTo); err != nil {
+		logger.Warnf("Failed to store reply-to: %v", err)
+	}
 
 	// Voice notes wait for their transcript before publication, so every
 	// consumer sees one event with the text attached rather than two.
@@ -778,6 +786,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 				MediaType:  mediaType,
 				Filename:   filename,
 				HasMedia:   mediaType != "" && mediaType != mediaTypePoll,
+				ReplyTo:    messageStore.nameReply(replyTo),
 			}
 			if poll != nil {
 				view := tallyPoll(*poll, nil)
@@ -1784,6 +1793,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					if err := messageStore.StorePoll(msgID, chatJID, *poll); err != nil {
 						logger.Warnf("Failed to store history poll: %v", err)
 					}
+				}
+				if err := messageStore.SetReplyTo(msgID, chatJID, extractReplyTo(ctx, client.Store, msg.Message.Message, jid)); err != nil {
+					logger.Warnf("Failed to store history reply-to: %v", err)
 				}
 
 				syncedCount++
