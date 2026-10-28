@@ -69,7 +69,8 @@ type sendQueue struct {
 	store       *sendQueueStore
 	// checkFresh, if set, refuses a send whose chat has moved on since its
 	// LatestMessageID (see freshness.go): a non-empty refusal, or err on a
-	// database failure. Run at submission and again just before sending.
+	// database failure. Run at submission only: a send already queued is
+	// never dropped, since nothing would prompt its author to try again.
 	checkFresh func(SendMessageRequest) (refusal string, err error)
 
 	wireOnce sync.Once
@@ -150,11 +151,6 @@ func (q *sendQueue) mainOnDue(ctx context.Context, job *sendJob) {
 		return
 	}
 	defer job.cleanup()
-	if refusal := q.freshnessRefusal(job.req); refusal != "" {
-		fmt.Printf("Not sending %s: %s\n", job.id, refusal)
-		q.finish(job, false, refusal)
-		return
-	}
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	success, message := q.send(sendCtx, job.req)

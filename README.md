@@ -208,8 +208,7 @@ reply — key it on the draft, not the attempt.
 A send can also carry a **`latest_message_id`**: the newest message in the
 chat its author had read (`""` for a chat believed empty). If anything has
 arrived since, the send is refused with `409` and `stale: true`, and nothing is
-queued. The check runs again just before the queued message goes out; if the
-chat moved on in the meantime the send fails with the same explanation. The
+queued. The check is made on submission only; a queued send always goes out. The
 bridge's own `/api/send` messages don't count as new, so a batch of replies to
 one chat can share an id. Messages typed on the phone do count. Chats report
 `last_message_id` for this. The MCP `send_message` / `send_messages` tools

@@ -6,13 +6,13 @@ import (
 )
 
 // A send can name the newest message its author had read in the chat
-// (SendMessageRequest.LatestMessageID). It is refused if anything has arrived
-// since, both when submitted and again just before it goes out, so an agent
-// never answers a conversation that has moved on without it.
+// (SendMessageRequest.LatestMessageID). It is refused at submission if
+// anything has arrived since, so an agent never answers a conversation that
+// has moved on without it. Once queued it goes out regardless.
 //
 // Messages this bridge sent itself through /api/send do not count as new:
-// otherwise the second of two queued replies would be refused because of the
-// first. They are listed in api_sent_messages rather than flagged on the
+// otherwise a follow-up written against the same id would be refused once
+// the bot's own first reply had gone out. They are listed in api_sent_messages rather than flagged on the
 // messages row, which StoreMessage's INSERT OR REPLACE would reset.
 
 func createFreshnessTables(db *sql.DB) error {

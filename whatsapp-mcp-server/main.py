@@ -372,10 +372,9 @@ def send_message(
     message in the chat you have read (from list_messages' `latest_message_ids`).
     If anything has arrived since, nothing is sent and the reply has `stale: true`:
     call list_messages for the chat, read what is new, reconsider your reply and
-    send again with the new id. The same check runs again just before the queued
-    message goes out; if the chat moved on in the meantime it is dropped, and
-    get_send_status reports it failed with the same explanation. This account's
-    own messages sent through this tool do not count as new.
+    send again with the new id. The check happens on submission only: once
+    queued, the message goes out. This account's own messages sent through this
+    tool do not count as new.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,

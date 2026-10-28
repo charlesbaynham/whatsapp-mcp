@@ -393,9 +393,9 @@ type SendMessageRequest struct {
 	// (a week, or the newest 500 finished sends).
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// LatestMessageID, when set, is the newest message in the chat the sender
-	// had read ("" for a chat it believes empty). The send is refused if a
-	// message has arrived since, at submission and again just before it goes
-	// out; see freshness.go. Nil skips the check.
+	// had read ("" for a chat it believes empty). The send is refused at
+	// submission if a message has arrived since; see freshness.go. Nil skips
+	// the check.
 	LatestMessageID *string `json:"latest_message_id,omitempty"`
 	// uploadName is the original filename of a multipart upload, used as the
 	// document title instead of the temp file's name.

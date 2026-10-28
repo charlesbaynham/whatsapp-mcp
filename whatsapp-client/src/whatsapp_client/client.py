@@ -261,8 +261,7 @@ class WhatsAppClient:
         ``latest_message_id`` is the newest message in the chat the reply was
         written against (``""`` for a chat believed empty; None skips the
         check). If anything has arrived since, the send is refused
-        (BridgeError, status 409) when submitted, or fails just before it would
-        have gone out.
+        (BridgeError, status 409) and nothing is queued.
         """
         body: Dict[str, Any] = {"recipient": recipient, "message": message, "block": block}
         if idempotency_key:
