@@ -36,6 +36,19 @@ class ErrorFoldingTests(unittest.TestCase):
             main.start_typing("c@s.whatsapp.net")
         st.assert_called_once_with("c@s.whatsapp.net", None)
 
+    def test_create_group_passes_through(self):
+        with mock.patch.object(main.wa, "create_group", return_value={"success": True}) as cg:
+            main.create_group("Dinner", ["1"], "Friday")
+        cg.assert_called_once_with("Dinner", ["1"], "Friday")
+
+    def test_create_group_needs_name_and_participants(self):
+        self.assertFalse(main.create_group("", ["1"])["success"])
+        self.assertFalse(main.create_group("G", [])["success"])
+
+    def test_create_group_folds_errors(self):
+        with mock.patch.object(main.wa, "create_group", side_effect=BridgeError("name too long", status=400)):
+            self.assertEqual(main.create_group("G", ["1"]), {"success": False, "message": "name too long"})
+
     def test_typing_needs_a_chat(self):
         self.assertFalse(main.start_typing("")["success"])
         self.assertFalse(main.stop_typing("")["success"])
