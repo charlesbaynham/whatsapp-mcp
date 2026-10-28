@@ -119,6 +119,10 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := createDisappearingTable(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := ensureReplyColumns(db); err != nil {
 		db.Close()
 		return nil, err
@@ -604,6 +608,14 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 		msg.Conversation = proto.String(message)
 	}
 
+	// Match the chat's disappearing-messages timer, or WhatsApp marks the
+	// message as conflicting with it and it never disappears.
+	timer, err := disappearingTimerForSend(ctx, messageStore, client, recipientJID)
+	if err != nil {
+		logger.Warnf("Couldn't look up disappearing timer for %s, sending without: %v", recipientJID, err)
+	}
+	applyDisappearingTimer(msg, timer)
+
 	// Send message
 	resp, err := client.SendMessage(ctx, recipientJID, msg)
 
@@ -716,6 +728,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pub *Pu
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
+
+	if err := noteDisappearingFromMessage(messageStore, chatJID, msg); err != nil {
+		logger.Warnf("Failed to record disappearing timer for %s: %v", chatJID, err)
+	}
 
 	// A vote updates a poll already in the store rather than being a
 	// message of its own, so it neither bumps the chat nor gets a row.
@@ -1464,6 +1480,18 @@ func main() {
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger, logBodies)
 
+		case *events.GroupInfo:
+			if v.Ephemeral != nil {
+				if err := messageStore.SetDisappearingTimer(v.JID.String(), timerFromGroup(*v.Ephemeral), v.Timestamp); err != nil {
+					logger.Warnf("Failed to record disappearing timer for %s: %v", v.JID, err)
+				}
+			}
+
+		case *events.JoinedGroup:
+			if err := messageStore.SetDisappearingTimer(v.GroupInfo.JID.String(), timerFromGroup(v.GroupInfo.GroupEphemeral), time.Now()); err != nil {
+				logger.Warnf("Failed to record disappearing timer for %s: %v", v.GroupInfo.JID, err)
+			}
+
 		case *events.Receipt:
 			handleReceipt(client, messageStore, pub, v, logger)
 
@@ -1680,6 +1708,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+
+		// The conversation carries the chat's timer; stamped at the time it
+		// was set, so a live change since then still wins.
+		if conversation.EphemeralExpiration != nil {
+			t := DisappearingTimer{Expiration: conversation.GetEphemeralExpiration(), SettingTimestamp: conversation.GetEphemeralSettingTimestamp()}
+			if err := messageStore.SetDisappearingTimer(chatJID, t, time.Unix(t.SettingTimestamp, 0)); err != nil {
+				logger.Warnf("Failed to record disappearing timer for %s: %v", chatJID, err)
+			}
+		}
 
 		// Process messages
 		messages := conversation.Messages

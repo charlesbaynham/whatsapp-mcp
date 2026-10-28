@@ -366,6 +366,17 @@ Instead of polling, you can have the bridge push new messages to a URL as they a
 4. Every new message in that chat now starts a new Routine run. `debounce_seconds` is recommended for busy chats since each `POST` starts a fresh run — without it, a burst of messages triggers a burst of runs. The debounce is trailing and per chat: a chat's messages are delivered together once it has been quiet for `debounce_seconds`, with each new message restarting the wait, but never more than 5 minutes after the batch's first message (`WHATSAPP_WEBHOOK_DEBOUNCE_MAX_WAIT_SECONDS`), so someone typing steadily still gets an answer. `ttl_seconds=3600` here means the subscription stops itself after an hour.
 5. Use `test_subscription(subscription_id)` to confirm the fire URL accepts requests before relying on it live.
 
+### Disappearing messages
+
+Sends follow each chat's disappearing-messages timer, so the bot's messages
+vanish on the same schedule as everyone else's rather than showing WhatsApp's
+"conflict with the disappearing messages timer" mark. The bridge learns a
+chat's timer from the setting-change message, the timer every incoming message
+carries, group info, and history sync. A group is looked up the first time the
+bridge sends there; a DM the bridge has never received a message in is assumed
+to have the timer off until the other person writes. Messages are still kept
+in the bridge's own store after they disappear from phones.
+
 ### Typing indicators
 
 An agent answering a message takes time to do it: the session has to start,
