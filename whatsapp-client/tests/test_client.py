@@ -62,6 +62,14 @@ class RequestShapeTests(unittest.TestCase):
         self.assertEqual(json.loads(rec.requests[0].content), {
             "chat_jid": "c@s.whatsapp.net", "state": "composing"})
 
+    def test_create_group_body(self):
+        client, rec = make_client(lambda r: httpx.Response(200, json={"success": True}))
+        client.create_group("Dinner", ["447700900001"], description="Friday")
+        req = rec.requests[0]
+        self.assertEqual((req.method, req.url.path), ("POST", "/api/groups"))
+        self.assertEqual(json.loads(req.content), {
+            "name": "Dinner", "participants": ["447700900001"], "description": "Friday"})
+
     def test_stop_typing_body(self):
         client, rec = make_client(lambda r: httpx.Response(200, json={"success": True}))
         client.stop_typing("c@s.whatsapp.net")

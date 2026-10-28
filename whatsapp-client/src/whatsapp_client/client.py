@@ -374,6 +374,16 @@ class WhatsAppClient:
             "oldest_message_timestamp": oldest_message_timestamp,
             "oldest_message_from_me": oldest_message_from_me, "count": count})
 
+    # --- groups ---
+
+    def create_group(self, name: str, participants: List[str],
+                     description: Optional[str] = None) -> Dict[str, Any]:
+        """Create a group owned by this account. `participants` are phone numbers or user JIDs."""
+        body: Dict[str, Any] = {"name": name, "participants": list(participants)}
+        if description:
+            body["description"] = description
+        return self._json("POST", "/groups", json=body)
+
     # --- typing indicator ---
 
     def start_typing(self, chat_jid: str, duration_seconds: Optional[int] = None) -> Dict[str, Any]:

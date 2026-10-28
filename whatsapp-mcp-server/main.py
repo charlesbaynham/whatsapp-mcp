@@ -662,6 +662,33 @@ def mark_chat_read(chat_jid: str, send_receipt: bool = False) -> Dict[str, Any]:
 
 
 @mcp.tool()
+def create_group(name: str, participants: List[str], description: Optional[str] = None) -> Dict[str, Any]:
+    """Create a new WhatsApp group owned by this (the bot's) account.
+
+    The bot becomes the group's admin; it does not need to be listed. Adding
+    someone to a group counts as reaching out to them, so only add people the
+    user has asked for. Numbers not on WhatsApp are skipped before the group is
+    created, and the call is refused while the reach-out time-lock is active.
+
+    Some people cannot be added directly (privacy settings, error_code 403).
+    They are reported with added=False, and an invite_link is returned that can
+    be sent to them with send_message.
+
+    Args:
+        name: Group name, at most 25 characters
+        participants: Phone numbers (country code, no "+" needed) or user JIDs
+        description: Optional group description
+
+    Returns:
+        success, message, group_jid (use it as the recipient for send_message),
+        per-participant results, and invite_link when someone was not added
+    """
+    if not name or not participants:
+        return {"success": False, "message": "name and at least one participant must be provided"}
+    return _result(lambda: wa.create_group(name, participants, description))
+
+
+@mcp.tool()
 def start_typing(chat_jid: str, duration_seconds: int = 0) -> Dict[str, Any]:
     """Show "typing..." in a chat while a reply is being worked out.
 

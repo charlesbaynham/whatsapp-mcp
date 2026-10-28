@@ -294,6 +294,7 @@ Claude can access the following tools to interact with WhatsApp:
 - **download_media**: Download media from a WhatsApp message into the bridge's store and get its path (on the bridge host)
 - **media_link**: Get a short-lived signed URL for a message's media, so an agent on another machine can download the file and decide whether to open it
 - **mark_chat_read**: Explicitly mark a chat as read, optionally sending real read receipts
+- **create_group**: Create a group owned by the bot with the given participants; returns the group JID and an invite link for anyone who could not be added directly
 - **start_typing**: Show "typing…" in a chat while a reply is being worked out (the bridge starts this by itself when a message wakes an agent; this extends it)
 - **stop_typing**: Take "typing…" away again when the decision turns out to be not to reply
 - **subscribe_chat**: Push new messages in a chat (or `"*"` for all chats) to a URL as they arrive, instead of polling

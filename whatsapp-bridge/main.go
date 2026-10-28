@@ -1065,6 +1065,9 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 	registerTypingRoutes(mux, typing, func(w http.ResponseWriter) bool {
 		return requireReady(client, w)
 	})
+	registerGroupRoutes(mux, client, messageStore, reachoutLock.activeNow, func(w http.ResponseWriter) bool {
+		return requireReady(client, w)
+	})
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		jid := ""
