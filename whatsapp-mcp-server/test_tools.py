@@ -14,12 +14,12 @@ from whatsapp_client import BridgeError
 class ErrorFoldingTests(unittest.TestCase):
     def test_send_message_bridge_error_becomes_failure_dict(self):
         with mock.patch.object(main.wa, "send_message", side_effect=BridgeError("not connected", status=503)):
-            out = main.send_message("1", "hi")
+            out = main.send_message("1", "hi", "m0")
         self.assertEqual(out, {"success": False, "message": "not connected"})
 
     def test_send_message_passes_bridge_result_through(self):
         with mock.patch.object(main.wa, "send_message", return_value={"success": True, "message": "sent"}):
-            self.assertEqual(main.send_message("1", "hi"), {"success": True, "message": "sent"})
+            self.assertEqual(main.send_message("1", "hi", "m0"), {"success": True, "message": "sent"})
 
     def test_mark_chat_read_error_keeps_shape(self):
         with mock.patch.object(main.wa, "mark_chat_read", side_effect=BridgeError("boom")):
@@ -69,8 +69,8 @@ class ErrorFoldingTests(unittest.TestCase):
 
     def test_sends_queue_by_default(self):
         with mock.patch.object(main.wa, "send_message", return_value={"success": True, "queued": True}) as sm:
-            main.send_message("1", "hi")
-        sm.assert_called_once_with("1", "hi", block=False)
+            main.send_message("1", "hi", "m0")
+        sm.assert_called_once_with("1", "hi", block=False, latest_message_id="m0")
         with mock.patch.object(main.wa, "send_file", return_value={"success": True, "message": "ok"}) as sf:
             main.send_file("1", "/tmp/x.jpg")
         sf.assert_called_once_with("1", path="/tmp/x.jpg", block=False)
@@ -78,17 +78,17 @@ class ErrorFoldingTests(unittest.TestCase):
     def test_idempotency_key_reaches_the_bridge(self):
         with mock.patch.object(main.wa, "send_message",
                                return_value={"success": True, "duplicate": True, "id": "snd-1"}) as sm:
-            out = main.send_message("1", "hi", idempotency_key="reply-1")
-        sm.assert_called_once_with("1", "hi", block=False, idempotency_key="reply-1")
+            out = main.send_message("1", "hi", "m0", idempotency_key="reply-1")
+        sm.assert_called_once_with("1", "hi", block=False, latest_message_id="m0", idempotency_key="reply-1")
         self.assertTrue(out["duplicate"])
         with mock.patch.object(main.wa, "send_message", return_value={"success": True, "id": "snd-2"}) as sm:
-            main.send_messages([{"recipient": "1", "message": "a", "idempotency_key": "k"}])
-        sm.assert_called_once_with("1", "a", idempotency_key="k")
+            main.send_messages([{"recipient": "1", "message": "a", "latest_message_id": "m0", "idempotency_key": "k"}])
+        sm.assert_called_once_with("1", "a", latest_message_id="m0", idempotency_key="k")
 
     def test_block_reaches_the_bridge(self):
         with mock.patch.object(main.wa, "send_message", return_value={"success": True, "message": "sent"}) as sm:
-            main.send_message("1", "hi", block=True)
-        sm.assert_called_once_with("1", "hi", block=True)
+            main.send_message("1", "hi", "m0", block=True)
+        sm.assert_called_once_with("1", "hi", block=True, latest_message_id="m0")
 
     def test_get_send_status_folds_errors(self):
         with mock.patch.object(main.wa, "send_status", return_value={"id": "snd-1", "state": "sent"}):
@@ -243,8 +243,8 @@ class BatchSendTests(unittest.TestCase):
                    {"success": True, "queued": True, "id": "snd-2"}]
         with mock.patch.object(main.wa, "send_message", side_effect=replies) as sm:
             out = main.send_messages([
-                {"recipient": "1", "message": "first"},
-                {"recipient": "2@g.us", "message": "second"},
+                {"recipient": "1", "message": "first", "latest_message_id": "m0"},
+                {"recipient": "2@g.us", "message": "second", "latest_message_id": "m0"},
             ])
         self.assertEqual([c.args for c in sm.call_args_list], [("1", "first"), ("2@g.us", "second")])
         self.assertTrue(out["success"])
@@ -253,9 +253,9 @@ class BatchSendTests(unittest.TestCase):
 
     def test_a_bad_entry_queues_nothing(self):
         with mock.patch.object(main.wa, "send_message") as sm:
-            empty_text = main.send_messages([{"recipient": "1", "message": "hi"},
-                                             {"recipient": "2", "message": ""}])
-            no_recipient = main.send_messages([{"recipient": "", "message": "hi"}])
+            empty_text = main.send_messages([{"recipient": "1", "message": "hi", "latest_message_id": "m0"},
+                                             {"recipient": "2", "message": "", "latest_message_id": "m0"}])
+            no_recipient = main.send_messages([{"recipient": "", "message": "hi", "latest_message_id": "m0"}])
             malformed = main.send_messages([{"recipient": "1"}])
             empty_batch = main.send_messages([])
         sm.assert_not_called()
@@ -267,9 +267,9 @@ class BatchSendTests(unittest.TestCase):
         replies = [{"success": True, "queued": True, "id": "snd-1"},
                    BridgeError("Send queue is full", status=503)]
         with mock.patch.object(main.wa, "send_message", side_effect=replies) as sm:
-            out = main.send_messages([{"recipient": "1", "message": "a"},
-                                      {"recipient": "1", "message": "b"},
-                                      {"recipient": "1", "message": "c"}])
+            out = main.send_messages([{"recipient": "1", "message": "a", "latest_message_id": "m0"},
+                                      {"recipient": "1", "message": "b", "latest_message_id": "m0"},
+                                      {"recipient": "1", "message": "c", "latest_message_id": "m0"}])
         self.assertEqual(sm.call_count, 2)  # the third is never submitted
         self.assertFalse(out["success"])
         self.assertEqual(out["queued"], 1)
@@ -278,9 +278,45 @@ class BatchSendTests(unittest.TestCase):
 
     def test_accepts_parsed_models(self):
         with mock.patch.object(main.wa, "send_message", return_value={"success": True, "id": "snd-1"}) as sm:
-            out = main.send_messages([main.OutgoingMessage(recipient="1", message="hi")])
-        sm.assert_called_once_with("1", "hi")
+            out = main.send_messages([main.OutgoingMessage(recipient="1", message="hi", latest_message_id="m0")])
+        sm.assert_called_once_with("1", "hi", latest_message_id="m0")
         self.assertTrue(out["success"])
+
+class FreshnessTests(unittest.TestCase):
+    """Replies name the newest message they were written against."""
+
+    def test_list_messages_reports_latest_ids(self):
+        msgs = [{"id": "a", "chat_jid": "1@s.whatsapp.net"}, {"id": "b", "chat_jid": "2@g.us"}]
+        chats = {"1@s.whatsapp.net": {"last_message_id": "a9"}, "2@g.us": {"last_message_id": "b9"}}
+        with mock.patch.object(main.wa, "list_messages", side_effect=[msgs, []]), \
+             mock.patch.object(main.wa, "get_chat", side_effect=lambda j, **_: chats.get(j)):
+            out = main.list_messages(query="x")
+            empty = main.list_messages(chat_jid="3@s.whatsapp.net")
+        self.assertEqual(out["messages"], msgs)
+        self.assertEqual(out["latest_message_ids"], {"1@s.whatsapp.net": "a9", "2@g.us": "b9"})
+        self.assertEqual(empty["latest_message_ids"], {"3@s.whatsapp.net": None})
+
+    def test_null_latest_means_empty_chat(self):
+        with mock.patch.object(main.wa, "send_message", return_value={"success": True}) as sm:
+            main.send_message("1", "hi", None)
+            main.send_messages([{"recipient": "1", "message": "hi", "latest_message_id": None}])
+        self.assertEqual([c.kwargs["latest_message_id"] for c in sm.call_args_list], ["", ""])
+
+    def test_stale_refusal_is_flagged(self):
+        err = BridgeError("Not sent: 1 new message(s) ... Call list_messages", status=409)
+        with mock.patch.object(main.wa, "send_message", side_effect=err):
+            one = main.send_message("1", "hi", "m0")
+        with mock.patch.object(main.wa, "send_message", side_effect=[{"success": True, "id": "s1"}, err]) as sm:
+            batch = main.send_messages([{"recipient": "1", "message": "a", "latest_message_id": "m0"},
+                                        {"recipient": "2", "message": "b", "latest_message_id": "m0"},
+                                        {"recipient": "2", "message": "c", "latest_message_id": "m0"}])
+        self.assertFalse(one["success"])
+        self.assertTrue(one["stale"])
+        self.assertIn("list_messages", one["message"])
+        self.assertTrue(batch["stale"])
+        self.assertEqual(sm.call_count, 2)
+        self.assertTrue(batch["results"][1]["stale"])
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -293,7 +329,7 @@ class NewContactWarningTests(unittest.TestCase):
         reply = {"success": True, "queued": True, "id": "snd-1", "new_contact": True,
                  "ahead": 2, "estimated_wait_seconds": 3600}
         with mock.patch.object(main.wa, "send_message", return_value=reply):
-            out = main.send_message("447700900000", "hi")
+            out = main.send_message("447700900000", "hi", "m0")
         self.assertTrue(out["new_contact"])
         self.assertIn("never been messaged", out["warning"])
         self.assertIn("about 1.0 h", out["warning"])
@@ -301,7 +337,7 @@ class NewContactWarningTests(unittest.TestCase):
 
     def test_ordinary_send_has_no_warning(self):
         with mock.patch.object(main.wa, "send_message", return_value={"success": True, "queued": True, "id": "snd-1"}):
-            out = main.send_message("447700900000", "hi")
+            out = main.send_message("447700900000", "hi", "m0")
         self.assertNotIn("warning", out)
 
     def test_media_sends_warn_too(self):
@@ -317,9 +353,9 @@ class NewContactWarningTests(unittest.TestCase):
                    {"success": True, "queued": True, "id": "snd-3", "new_contact": True,
                     "ahead": 1, "estimated_wait_seconds": 1860}]
         with mock.patch.object(main.wa, "send_message", side_effect=replies):
-            out = main.send_messages([{"recipient": "1", "message": "a"},
-                                      {"recipient": "2", "message": "b"},
-                                      {"recipient": "3", "message": "c"}])
+            out = main.send_messages([{"recipient": "1", "message": "a", "latest_message_id": "m0"},
+                                      {"recipient": "2", "message": "b", "latest_message_id": "m0"},
+                                      {"recipient": "3", "message": "c", "latest_message_id": "m0"}])
         self.assertTrue(out["success"])
         self.assertEqual(out["new_contacts"], 2)
         self.assertEqual(out["estimated_completion_seconds"], 1860)
@@ -333,7 +369,7 @@ class NewContactWarningTests(unittest.TestCase):
         replies = [{"success": True, "queued": True, "id": "snd-1", "estimated_wait_seconds": 0},
                    {"success": True, "queued": True, "id": "snd-2", "ahead": 1, "estimated_wait_seconds": 30}]
         with mock.patch.object(main.wa, "send_message", side_effect=replies):
-            out = main.send_messages([{"recipient": "1", "message": "a"}, {"recipient": "1", "message": "b"}])
+            out = main.send_messages([{"recipient": "1", "message": "a", "latest_message_id": "m0"}, {"recipient": "1", "message": "b", "latest_message_id": "m0"}])
         self.assertEqual(out["new_contacts"], 0)
         self.assertEqual(out["estimated_completion_seconds"], 30)
         self.assertNotIn("warning", out)

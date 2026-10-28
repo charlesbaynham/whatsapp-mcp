@@ -115,6 +115,10 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := createFreshnessTables(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := ensureReplyColumns(db); err != nil {
 		db.Close()
 		return nil, err
@@ -360,6 +364,9 @@ type SendMessageResponse struct {
 	// already accepted, so nothing new was queued: ID is that earlier
 	// submission, and Queued says whether it is still waiting.
 	Duplicate bool `json:"duplicate,omitempty"`
+	// Stale reports a send refused because the chat has moved on since
+	// LatestMessageID: nothing was queued.
+	Stale bool `json:"stale,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -385,6 +392,11 @@ type SendMessageRequest struct {
 	// sending the reply. Remembered as long as the submission's outcome is
 	// (a week, or the newest 500 finished sends).
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	// LatestMessageID, when set, is the newest message in the chat the sender
+	// had read ("" for a chat it believes empty). The send is refused at
+	// submission if a message has arrived since; see freshness.go. Nil skips
+	// the check.
+	LatestMessageID *string `json:"latest_message_id,omitempty"`
 	// uploadName is the original filename of a multipart upload, used as the
 	// document title instead of the temp file's name.
 	uploadName string
@@ -632,6 +644,9 @@ func sendWhatsAppMedia(ctx context.Context, client *whatsmeow.Client, messageSto
 	if err := messageStore.StoreMessage(resp.ID, chatJID, sender, content, resp.Timestamp, true,
 		mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
 		logger.Warnf("Failed to store sent message: %v", err)
+	}
+	if err := messageStore.MarkSentViaAPI(resp.ID, chatJID); err != nil {
+		logger.Warnf("Failed to record sent message: %v", err)
 	}
 	if poll != nil {
 		if err := messageStore.StorePoll(resp.ID, chatJID, *poll); err != nil {
@@ -1045,6 +1060,7 @@ func startRESTServer(queueCtx context.Context, client *whatsmeow.Client, message
 	queue := newSendQueue(newSendGateFromEnv(), func(ctx context.Context, req SendMessageRequest) (bool, string) {
 		return sendWhatsAppMedia(ctx, client, messageStore, reachoutLock, req.Recipient, req.Message, req.MediaPath, req.uploadName, req.VoiceNote, req.poll, typing, logger)
 	})
+	queue.checkFresh = messageStore.checkReplyFresh
 	queue.newContacts = newNewContactStage(newNewContactGateFromEnv(), func(recipient string) bool {
 		return isNewContact(messageStore, recipient)
 	}, reachoutLock.activeNow)

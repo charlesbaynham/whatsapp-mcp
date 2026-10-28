@@ -205,6 +205,15 @@ so a retry goes through. Keys are remembered as long as the send's outcome is
 agents woken for the same conversation both deciding to send the same drafted
 reply — key it on the draft, not the attempt.
 
+A send can also carry a **`latest_message_id`**: the newest message in the
+chat its author had read (`""` for a chat believed empty). If anything has
+arrived since, the send is refused with `409` and `stale: true`, and nothing is
+queued. The check is made on submission only; a queued send always goes out. The
+bridge's own `/api/send` messages don't count as new, so a batch of replies to
+one chat can share an id. Messages typed on the phone do count. Chats report
+`last_message_id` for this. The MCP `send_message` / `send_messages` tools
+require it, and `list_messages` returns it per chat as `latest_message_ids`.
+
 This exists because WhatsApp unlinked a bridge's device mid-way through a burst
 of rapid first-contact messages: to their heuristics, a linked device sending
 back-to-back is a spammer.
@@ -276,7 +285,7 @@ Once connected, you can interact with your WhatsApp contacts through Claude, lev
 Claude can access the following tools to interact with WhatsApp:
 
 - **search_contacts**: Search for contacts by name or phone number
-- **list_messages**: Retrieve messages with optional filters and context
+- **list_messages**: Retrieve messages with optional filters and context, plus `latest_message_ids` (each chat's newest message id) to pass to the send tools
 - **list_chats**: List available chats with metadata, optionally filtered to only chats with unread messages via `unread_only`
 - **list_unread_chats**: List chats that currently have unread incoming messages
 - **get_chat**: Get information about a specific chat
@@ -284,7 +293,7 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
-- **send_message**: Send a WhatsApp message to a specified phone number or group JID
+- **send_message**: Send a WhatsApp message to a specified phone number or group JID; requires the chat's `latest_message_id` and refuses the send if newer messages have arrived
 - **send_messages**: Queue several messages in one call — same queue, same spacing, one approval; reports how many are new contacts and when the last is expected to leave
 - **send_poll**: Send a WhatsApp poll (question, 2–12 options, single or multiple choice) through the same queue
 - **get_poll_results**: Read a poll's current outcome: per-option tallies with voter names, and each voter's selection

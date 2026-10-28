@@ -48,11 +48,14 @@ type ChatView struct {
 	Name            string     `json:"name"`
 	LastMessageTime *time.Time `json:"last_message_time"`
 	LastMessage     *string    `json:"last_message"`
-	LastSender      *string    `json:"last_sender"`
-	LastIsFromMe    *bool      `json:"last_is_from_me"`
-	UnreadCount     int        `json:"unread_count"`
-	LastReadAt      *time.Time `json:"last_read_at"`
-	IsGroup         bool       `json:"is_group"`
+	// LastMessageID is the newest message's id, by the same ordering the
+	// latest_message_id freshness check uses (freshness.go).
+	LastMessageID *string    `json:"last_message_id"`
+	LastSender    *string    `json:"last_sender"`
+	LastIsFromMe  *bool      `json:"last_is_from_me"`
+	UnreadCount   int        `json:"unread_count"`
+	LastReadAt    *time.Time `json:"last_read_at"`
+	IsGroup       bool       `json:"is_group"`
 }
 
 // ContactView is one contact (a non-group chat row) as the read API returns it.
@@ -401,15 +404,20 @@ type ListChatsParams struct {
 	UnreadOnly         bool
 }
 
-const chatSelectColumns = `c.jid, COALESCE(c.name, ''), c.last_message_time, m.content, m.sender, m.is_from_me, %s, c.last_read_timestamp`
+const chatSelectColumns = `c.jid, COALESCE(c.name, ''), c.last_message_time, m.content, m.sender, m.is_from_me, %s, c.last_read_timestamp, ` + lastMessageIDExpr
+
+// lastMessageIDExpr selects a chat's newest message id.
+const lastMessageIDExpr = `(SELECT id FROM messages WHERE chat_jid = c.jid ` + latestMessageOrder + ` LIMIT 1)`
 
 func chatSelect(includeLastMessage bool) string {
 	q := fmt.Sprintf(`SELECT `+chatSelectColumns+` FROM chats c`, unreadCountExpr("c"))
 	if includeLastMessage {
-		q += ` LEFT JOIN messages m ON c.jid = m.chat_jid AND c.last_message_time = m.timestamp`
+		// Join on the newest id, not on last_message_time: two messages in the
+		// same second would otherwise return the chat twice.
+		q += ` LEFT JOIN messages m ON m.chat_jid = c.jid AND m.id = ` + lastMessageIDExpr
 	} else {
 		// Keep the column list stable: join nothing, select NULLs.
-		q = fmt.Sprintf(`SELECT c.jid, COALESCE(c.name, ''), c.last_message_time, NULL, NULL, NULL, %s, c.last_read_timestamp FROM chats c`, unreadCountExpr("c"))
+		q = fmt.Sprintf(`SELECT c.jid, COALESCE(c.name, ''), c.last_message_time, NULL, NULL, NULL, %s, c.last_read_timestamp, `+lastMessageIDExpr+` FROM chats c`, unreadCountExpr("c"))
 	}
 	return q
 }
@@ -417,9 +425,9 @@ func chatSelect(includeLastMessage bool) string {
 func scanChatView(row interface{ Scan(dest ...any) error }) (ChatView, error) {
 	var v ChatView
 	var lastTime, lastRead sql.NullTime
-	var lastMsg, lastSender sql.NullString
+	var lastMsg, lastSender, lastID sql.NullString
 	var lastFromMe sql.NullBool
-	if err := row.Scan(&v.JID, &v.Name, &lastTime, &lastMsg, &lastSender, &lastFromMe, &v.UnreadCount, &lastRead); err != nil {
+	if err := row.Scan(&v.JID, &v.Name, &lastTime, &lastMsg, &lastSender, &lastFromMe, &v.UnreadCount, &lastRead, &lastID); err != nil {
 		return ChatView{}, err
 	}
 	if lastTime.Valid {
@@ -433,6 +441,10 @@ func scanChatView(row interface{ Scan(dest ...any) error }) (ChatView, error) {
 	if lastMsg.Valid {
 		s := lastMsg.String
 		v.LastMessage = &s
+	}
+	if lastID.Valid {
+		s := lastID.String
+		v.LastMessageID = &s
 	}
 	if lastSender.Valid {
 		s := lastSender.String
