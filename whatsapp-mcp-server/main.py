@@ -82,7 +82,11 @@ def _result(call, **extra: Any) -> Dict[str, Any]:
     try:
         out = call()
     except BridgeError as e:
-        return {"success": False, "message": str(e), **extra}
+        out = {"success": False, "message": str(e), **extra}
+        if e.status == 409:
+            # Refused because the chat has moved on since latest_message_id.
+            out["stale"] = True
+        return out
     if isinstance(out, dict):
         return out
     return {"success": True, "message": "ok", **extra}
@@ -183,8 +187,14 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """Get WhatsApp messages matching specified criteria with optional context.
+
+    Returns `{messages, latest_message_ids}`. `latest_message_ids` maps each
+    chat in the results (and `chat_jid`, if given) to the id of its newest
+    message, or null for a chat with none. Pass it to send_message /
+    send_messages as `latest_message_id` when replying: the send is refused
+    if anything has arrived since.
 
     Voice notes carry the spoken text in `transcript` (with
     `transcription_status`) while `content` stays as WhatsApp delivered it,
@@ -212,11 +222,17 @@ def list_messages(
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
     """
-    return wa.list_messages(
+    messages = wa.list_messages(
         after=after, before=before, sender=sender_phone_number, chat_jid=chat_jid, query=query,
         limit=limit, page=page, include_context=include_context,
         context_before=context_before, context_after=context_after,
     )
+    chats = dict.fromkeys(([chat_jid] if chat_jid else []) + [m["chat_jid"] for m in messages])
+    latest = {}
+    for jid in chats:
+        chat = wa.get_chat(jid, include_last_message=False)
+        latest[jid] = chat.get("last_message_id") if chat else None
+    return {"messages": messages, "latest_message_ids": latest}
 
 
 @mcp.tool()
@@ -331,6 +347,7 @@ def get_message_context(
 def send_message(
     recipient: str,
     message: str,
+    latest_message_id: Optional[str],
     block: bool = False,
     idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -351,10 +368,22 @@ def send_message(
     Sending more than one message? Use send_messages instead: it queues the
     whole batch through the same path, in one tool call.
 
+    ⚠️ **Stale replies are refused.** `latest_message_id` must be the newest
+    message in the chat you have read (from list_messages' `latest_message_ids`).
+    If anything has arrived since, nothing is sent and the reply has `stale: true`:
+    call list_messages for the chat, read what is new, reconsider your reply and
+    send again with the new id. The same check runs again just before the queued
+    message goes out; if the chat moved on in the meantime it is dropped, and
+    get_send_status reports it failed with the same explanation. This account's
+    own messages sent through this tool do not count as new.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
+        latest_message_id: The id of the newest message in the chat, as
+                 list_messages reports it in `latest_message_ids`. Null only for
+                 a chat with no messages yet (e.g. a first contact).
         block: Wait for the message to actually leave and return the send's own
                  outcome instead of queueing (default False). The wait is the rate
                  limit's and can run to minutes, so only pass True when the
@@ -375,7 +404,7 @@ def send_message(
     """
     if not recipient:
         return {"success": False, "message": "Recipient must be provided"}
-    kwargs: Dict[str, Any] = {"block": block}
+    kwargs: Dict[str, Any] = {"block": block, "latest_message_id": latest_message_id or ""}
     if idempotency_key:
         kwargs["idempotency_key"] = idempotency_key
     return _note_new_contact(_result(lambda: wa.send_message(recipient, message, **kwargs)))
@@ -389,6 +418,11 @@ class OutgoingMessage(BaseModel):
         '(e.g. "123456789@s.whatsapp.net", or a group JID like "123456789@g.us")'
     ))
     message: str = Field(description="The message text to send")
+    latest_message_id: Optional[str] = Field(description=(
+        "Required. The id of the newest message in the recipient's chat, as list_messages reports it in "
+        "`latest_message_ids` (null only for a chat with no messages). The message is refused if anything has "
+        "arrived since (see send_message); repeat the same id for several messages to one chat"
+    ))
     idempotency_key: Optional[str] = Field(default=None, description=(
         "Optional. Sends this message at most once: a repeat with the same key is not queued again "
         "while the first is queued or sent (see send_message)"
@@ -419,6 +453,11 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
     reply says how many of the batch are first contacts and roughly when the
     last message is expected to leave; tell the user, and do not resend
     anything that is merely still queued.
+
+    ⚠️ Each message carries the `latest_message_id` of its chat, and is
+    refused if that chat has moved on (see send_message). A refusal stops the
+    batch like any other failure; the reply then has `stale: true`. List the
+    new messages, reconsider, and resend what is still appropriate.
 
     Args:
         messages: The messages to queue, each with a recipient and text
@@ -457,12 +496,15 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
                             "message": f"Not submitted: {halted}"})
             continue
         out = _result(lambda i=item: wa.send_message(
-            i.recipient, i.message, **({"idempotency_key": i.idempotency_key} if i.idempotency_key else {})))
+            i.recipient, i.message, latest_message_id=i.latest_message_id or "",
+            **({"idempotency_key": i.idempotency_key} if i.idempotency_key else {})))
         ok = bool(out.get("success"))
         entry = {"recipient": item.recipient, "success": ok,
                  "id": out.get("id"), "message": out.get("message", "")}
         if out.get("duplicate"):
             entry["duplicate"] = True
+        if out.get("stale"):
+            entry["stale"] = True
         if out.get("new_contact"):
             entry["new_contact"] = True
         if "estimated_wait_seconds" in out:
@@ -483,6 +525,7 @@ def send_messages(messages: List[OutgoingMessage]) -> Dict[str, Any]:
     # when the whole batch is expected to have left.
     completion = max((float(r.get("estimated_wait_seconds") or 0) for r in results if r["success"]), default=0.0)
     reply: Dict[str, Any] = {"success": queued == len(batch), "message": summary, "queued": queued,
+                             **({"stale": True} if any(r.get("stale") for r in results) else {}),
                              "new_contacts": new_contacts, "estimated_completion_seconds": int(completion),
                              "results": results}
     if new_contacts:

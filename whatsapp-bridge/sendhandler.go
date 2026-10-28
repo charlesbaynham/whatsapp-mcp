@@ -123,6 +123,14 @@ func sendHandler(queue *sendQueue, storeDir string, ready func(http.ResponseWrit
 			}
 		}
 
+		if refusal := queue.freshnessRefusal(req); refusal != "" {
+			fmt.Printf("Refusing send to %s: %s\n", req.Recipient, refusal)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Stale: true, Message: refusal})
+			return
+		}
+
 		job, pos, dup, queued := queue.submitOnce(req, cleanup)
 		if dup != nil {
 			fmt.Printf("Not re-sending: idempotency key already used by %s (%s)\n", dup.ID, dup.State)

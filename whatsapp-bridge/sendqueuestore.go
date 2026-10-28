@@ -71,6 +71,11 @@ func openSendQueueStore(storeDir string) (*sendQueueStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("adding idempotency_key column: %v", err)
 	}
+	// NULL: no freshness check (see SendMessageRequest.LatestMessageID).
+	if err := ensureColumn(db, "sendqueue_jobs", "latest_message_id", "TEXT"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("adding latest_message_id column: %v", err)
+	}
 	if _, err := db.Exec(sendQueueIndexes); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating sendqueue indexes: %v", err)
@@ -100,7 +105,8 @@ CREATE TABLE IF NOT EXISTS sendqueue_jobs (
 	success INTEGER NOT NULL DEFAULT 0,
 	outcome TEXT NOT NULL DEFAULT '',
 	sent_at TIMESTAMP,
-	idempotency_key TEXT NOT NULL DEFAULT ''
+	idempotency_key TEXT NOT NULL DEFAULT '',
+	latest_message_id TEXT
 );
 CREATE INDEX IF NOT EXISTS sendqueue_jobs_state_stage ON sendqueue_jobs (state, stage, due_at);
 `
@@ -141,11 +147,11 @@ func (s *sendQueueStore) insertJob(job *sendJob, newContact bool, stage string, 
 		INSERT INTO sendqueue_jobs
 			(id, recipient, message, media_path, upload_name, voice_note, poll,
 			 new_contact, new_contact_due_at, stage, due_at, queued_at, state, success, outcome, sent_at,
-			 idempotency_key)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', NULL, ?)`,
+			 idempotency_key, latest_message_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, '', NULL, ?, ?)`,
 		job.id, job.req.Recipient, job.req.Message, job.req.MediaPath, job.req.uploadName,
 		boolInt(job.req.VoiceNote), pollJSON, boolInt(newContact), newContactDueAt, stage, dueAt, queuedAt,
-		job.req.IdempotencyKey,
+		job.req.IdempotencyKey, job.req.LatestMessageID,
 	)
 	return err
 }
@@ -182,6 +188,8 @@ type persistedRow struct {
 	NewContact bool
 	DueAt      time.Time
 	QueuedAt   time.Time
+	// LatestMessageID carries the send's freshness check across a restart.
+	LatestMessageID *string
 }
 
 // request rebuilds the SendMessageRequest a recovered job needs to replay.
@@ -189,6 +197,7 @@ func (r persistedRow) request() SendMessageRequest {
 	return SendMessageRequest{
 		Recipient: r.Recipient, Message: r.Message, MediaPath: r.MediaPath,
 		VoiceNote: r.VoiceNote, uploadName: r.UploadName, poll: r.Poll,
+		LatestMessageID: r.LatestMessageID,
 	}
 }
 
@@ -196,7 +205,8 @@ func (r persistedRow) request() SendMessageRequest {
 // they are owed to leave (their due time; ties broken by submission order).
 func (s *sendQueueStore) loadQueued(stage string) ([]persistedRow, error) {
 	rows, err := s.db.Query(`
-		SELECT id, recipient, message, media_path, upload_name, voice_note, poll, new_contact, due_at, queued_at
+		SELECT id, recipient, message, media_path, upload_name, voice_note, poll, new_contact, due_at, queued_at,
+		       latest_message_id
 		FROM sendqueue_jobs WHERE state = ? AND stage = ? ORDER BY due_at ASC, rowid ASC`,
 		string(sendQueued), stage)
 	if err != nil {
@@ -208,9 +218,13 @@ func (s *sendQueueStore) loadQueued(stage string) ([]persistedRow, error) {
 		var r persistedRow
 		var pollJSON string
 		var voiceNote, newContact int
+		var latest sql.NullString
 		if err := rows.Scan(&r.ID, &r.Recipient, &r.Message, &r.MediaPath, &r.UploadName,
-			&voiceNote, &pollJSON, &newContact, &r.DueAt, &r.QueuedAt); err != nil {
+			&voiceNote, &pollJSON, &newContact, &r.DueAt, &r.QueuedAt, &latest); err != nil {
 			return nil, err
+		}
+		if latest.Valid {
+			r.LatestMessageID = &latest.String
 		}
 		r.VoiceNote = voiceNote != 0
 		r.NewContact = newContact != 0

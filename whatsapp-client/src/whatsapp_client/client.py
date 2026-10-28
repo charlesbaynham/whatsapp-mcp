@@ -241,6 +241,7 @@ class WhatsAppClient:
 
     def send_message(
         self, recipient: str, message: str, *, block: bool = False, idempotency_key: Optional[str] = None,
+        latest_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Queue a message. Returns `{success, queued, id, ahead,
         estimated_wait_seconds}` once accepted, plus ``new_contact: True`` for a
@@ -256,10 +257,18 @@ class WhatsAppClient:
         the same key is already queued or has gone out, nothing is queued and
         the reply carries ``duplicate: True`` and that earlier submission's id.
         A failed send does not use the key up.
+
+        ``latest_message_id`` is the newest message in the chat the reply was
+        written against (``""`` for a chat believed empty; None skips the
+        check). If anything has arrived since, the send is refused
+        (BridgeError, status 409) when submitted, or fails just before it would
+        have gone out.
         """
         body: Dict[str, Any] = {"recipient": recipient, "message": message, "block": block}
         if idempotency_key:
             body["idempotency_key"] = idempotency_key
+        if latest_message_id is not None:
+            body["latest_message_id"] = latest_message_id
         return self._json("POST", "/send", timeout=self._send_timeout(block), ok=SEND_OK, json=body)
 
     def send_poll(

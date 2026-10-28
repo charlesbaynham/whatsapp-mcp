@@ -67,6 +67,10 @@ type sendQueue struct {
 	newContacts *newContactStage // nil: first contacts are not held separately
 	send        func(ctx context.Context, req SendMessageRequest) (bool, string)
 	store       *sendQueueStore
+	// checkFresh, if set, refuses a send whose chat has moved on since its
+	// LatestMessageID (see freshness.go): a non-empty refusal, or err on a
+	// database failure. Run at submission and again just before sending.
+	checkFresh func(SendMessageRequest) (refusal string, err error)
 
 	wireOnce sync.Once
 
@@ -146,11 +150,29 @@ func (q *sendQueue) mainOnDue(ctx context.Context, job *sendJob) {
 		return
 	}
 	defer job.cleanup()
+	if refusal := q.freshnessRefusal(job.req); refusal != "" {
+		fmt.Printf("Not sending %s: %s\n", job.id, refusal)
+		q.finish(job, false, refusal)
+		return
+	}
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	success, message := q.send(sendCtx, job.req)
 	fmt.Println("Message sent", success, message)
 	q.finish(job, success, message)
+}
+
+// freshnessRefusal runs checkFresh, failing closed: a send whose freshness
+// cannot be confirmed is refused rather than sent blind.
+func (q *sendQueue) freshnessRefusal(req SendMessageRequest) string {
+	if q.checkFresh == nil {
+		return ""
+	}
+	refusal, err := q.checkFresh(req)
+	if err != nil {
+		return fmt.Sprintf("Not sent: could not check for new messages in the chat: %v", err)
+	}
+	return refusal
 }
 
 // queuePosition is where a submission landed and what that implies for the
