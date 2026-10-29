@@ -68,10 +68,16 @@ type wrappedMessage interface {
 // carries (extended text, image, video, document, sticker, ...), looking
 // through wrappers such as ephemeral or view-once messages.
 func findContextInfo(msg *waProto.Message) *waProto.ContextInfo {
-	return findContextInfoDepth(msg, 0)
+	return findContextInfoWith(msg, func(ci *waProto.ContextInfo) bool { return ci.GetStanzaID() != "" })
 }
 
-func findContextInfoDepth(msg *waProto.Message, depth int) *waProto.ContextInfo {
+// findContextInfoWith is findContextInfo for the first ContextInfo that
+// satisfies match.
+func findContextInfoWith(msg *waProto.Message, match func(*waProto.ContextInfo) bool) *waProto.ContextInfo {
+	return findContextInfoDepth(msg, match, 0)
+}
+
+func findContextInfoDepth(msg *waProto.Message, match func(*waProto.ContextInfo) bool, depth int) *waProto.ContextInfo {
 	if msg == nil || depth > 3 {
 		return nil
 	}
@@ -82,13 +88,13 @@ func findContextInfoDepth(msg *waProto.Message, depth int) *waProto.ContextInfo 
 		}
 		inner := v.Message().Interface()
 		if h, ok := inner.(contextInfoHolder); ok {
-			if ci := h.GetContextInfo(); ci.GetStanzaID() != "" {
+			if ci := h.GetContextInfo(); ci != nil && match(ci) {
 				found = ci
 				return false
 			}
 		}
 		if w, ok := inner.(wrappedMessage); ok {
-			if ci := findContextInfoDepth(w.GetMessage(), depth+1); ci != nil {
+			if ci := findContextInfoDepth(w.GetMessage(), match, depth+1); ci != nil {
 				found = ci
 				return false
 			}
