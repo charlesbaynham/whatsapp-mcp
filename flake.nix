@@ -1,5 +1,5 @@
 {
-  description = "WhatsApp bridge, MCP server and Hindsight forwarder, packaged as a cattle container. Two templates share this one app - `whatsapp` and `charlesbot-whatsapp` build the identical image, deployed as two separate containers each holding its own WhatsApp session and phone-number pairing.";
+  description = "WhatsApp bridge, MCP server and Hindsight forwarder, packaged as a cattle container. Three templates share this one app - `whatsapp`, `charlesbot-whatsapp` and `gaby-whatsapp` build near-identical images, deployed as separate containers each holding its own WhatsApp session and phone-number pairing.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   inputs.cattle.url = "git+https://github.com/charlesbaynham/nix-proxmox-cattle?ref=v1";
@@ -50,6 +50,11 @@
         # (unauthenticated_paths); only this instance has that route.
         "charlesbot-whatsapp" = mkWhatsapp "charlesbot-whatsapp" {
           mediaPublicUrl = "https://charlesbot-whatsapp.houseabsolute.co.uk";
+        };
+        # Gaby's own account: her messages must never reach Charles's memory bank.
+        "gaby-whatsapp" = mkWhatsapp "gaby-whatsapp" {
+          mediaPublicUrl = "https://gaby-whatsapp.houseabsolute.co.uk";
+          hindsight.enable = false;
         };
       };
     in
